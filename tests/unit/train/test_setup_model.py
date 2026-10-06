@@ -34,7 +34,12 @@ from speculators.train.checkpointer import (
     DistributedCheckpointer,
     SingleGPUCheckpointer,
 )
-from speculators.train.trainer import Trainer, TrainerConfig
+from speculators.train.trainer import (
+    Trainer,
+    TrainerConfig,
+    _ensure_fp32_master_weights,
+    _nonfinite_gradient_names,
+)
 from tests.conftest import requires_cuda, requires_multi_gpu
 
 # ---------------------------------------------------------------------------
@@ -218,6 +223,31 @@ def mock_checkpointer():
 # ===================================================================
 # Single GPU — Fresh Init
 # ===================================================================
+
+
+def test_pretrained_bfloat16_weights_are_promoted_to_fp32_master_weights():
+    """AdamW state must not inherit bf16 from a serialized checkpoint."""
+    model = _make_tiny_model().to(torch.bfloat16)
+    model.register_buffer("integer_buffer", torch.ones(1, dtype=torch.int64))
+
+    assert any(parameter.dtype == torch.bfloat16 for parameter in model.parameters())
+
+    _ensure_fp32_master_weights(model)
+
+    assert all(
+        not parameter.is_floating_point() or parameter.dtype == torch.float32
+        for parameter in model.parameters()
+    )
+    assert model.integer_buffer.dtype == torch.int64
+
+
+def test_nonfinite_gradient_names_reports_only_bad_parameters():
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 1))
+    for parameter in model.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    model[1].weight.grad[0, 1] = torch.nan
+
+    assert _nonfinite_gradient_names(model) == ["1.weight"]
 
 
 @requires_cuda

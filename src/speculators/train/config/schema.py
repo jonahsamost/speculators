@@ -538,6 +538,24 @@ class DSparkArgs(_Group):
     )
 
 
+class DSV4DSparkArgs(_Group):
+    """DeepSeek V4.1 native DSpark backbone shape."""
+
+    num_heads: int = 64
+    head_dim: int = 512
+    rope_head_dim: int = 64
+    q_lora_rank: int = 1280
+    o_lora_rank: int = 1024
+    o_groups: int = 8
+    window_size: int = 128
+    n_routed_experts: int = 128
+    n_shared_experts: int = 1
+    n_activated_experts: int = 3
+    moe_inter_dim: int = 2304
+    hc_mult: int = 4
+    hc_sinkhorn_iters: int = 20
+
+
 class ConfidenceArgs(_Group):
     """Acceptance-confidence training shared by supported speculators."""
 
@@ -650,6 +668,7 @@ _GROUPS: dict[str, type[_Group]] = {
     "dflash": DFlashArgs,
     "dflash2": DFlash2Args,
     "dspark": DSparkArgs,
+    "dsv4_dspark": DSV4DSparkArgs,
     "confidence": ConfidenceArgs,
     "xpress": XPressArgs,
     "peagle": PEagleArgs,
@@ -745,7 +764,7 @@ class TrainConfig(BaseSettings):
     speculator_type: str = Field(
         default="eagle3",
         description="Type of speculator model to train "
-        "(eagle3, dflash, dflash2, dspark, xpress, peagle, mtp).",
+        "(eagle3, dflash, dflash2, dspark, dsv4_dspark, xpress, peagle, mtp).",
     )
     dry_run: bool = Field(
         default=False,
@@ -772,6 +791,7 @@ class TrainConfig(BaseSettings):
     dflash: DFlashArgs = Field(default_factory=DFlashArgs)
     dflash2: DFlash2Args = Field(default_factory=DFlash2Args)
     dspark: DSparkArgs = Field(default_factory=DSparkArgs)
+    dsv4_dspark: DSV4DSparkArgs = Field(default_factory=DSV4DSparkArgs)
     xpress: XPressArgs = Field(default_factory=XPressArgs)
     peagle: PEagleArgs = Field(default_factory=PEagleArgs)
     mtp: MTPArgs = Field(default_factory=MTPArgs)
@@ -815,6 +835,7 @@ class TrainConfig(BaseSettings):
             "dspark",
             "dflash2",
             "xpress",
+            "dsv4_dspark",
         }
         if self.draft.draft_arch is None:
             self.draft.draft_arch = "llama" if is_eagle3 else "qwen3"
@@ -837,7 +858,10 @@ class TrainConfig(BaseSettings):
         if self.dflash.block_size is None:
             self.dflash.block_size = _DEFAULT_BLOCK_SIZE.get(self.speculator_type, 8)
         if self.confidence.enable_confidence_head is None:
-            self.confidence.enable_confidence_head = self.speculator_type == "dspark"
+            self.confidence.enable_confidence_head = self.speculator_type in {
+                "dspark",
+                "dsv4_dspark",
+            }
         return self
 
     @model_validator(mode="after")

@@ -65,3 +65,10 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
             "hidden state as the confidence-head input."
         ),
     )
+    confidence_head_bias: bool = Field(
+        default=True,
+        description=(
+            "Whether the confidence projection has a bias. Standalone DSpark "
+            "checkpoints historically use a bias; native DeepSeek V4 DSpark does not."
+        ),
+    )

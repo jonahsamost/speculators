@@ -58,7 +58,7 @@ class TestConvertCommand:
     def test_algorithm_choices_in_help(self):
         result = runner.invoke(app, ["convert", "--help"])
         assert result.exit_code == 0
-        for algo in ("eagle3", "mtp", "dflash"):
+        for algo in ("eagle3", "mtp", "dflash", "dsv4_dspark"):
             assert algo in unstyled_output(result)
 
     def test_missing_required_args(self):

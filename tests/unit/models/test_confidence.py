@@ -38,3 +38,19 @@ def test_masked_confidence_loss_masks_gradients() -> None:
     assert logits.grad is not None
     assert logits.grad[0, 0] != 0
     assert logits.grad[0, 1] == 0
+
+
+def test_masked_confidence_loss_computes_in_fp32() -> None:
+    logits = torch.tensor([[20.0, -20.0]], dtype=torch.bfloat16, requires_grad=True)
+    # Targets are analytical probabilities, so tolerate small numerical drift
+    # at the boundary by clamping them to their documented domain.
+    targets = torch.tensor([[1.01, -0.01]], dtype=torch.bfloat16)
+    mask = torch.ones_like(targets)
+
+    loss = masked_confidence_loss(logits, targets, mask)
+    loss.backward()
+
+    assert loss.dtype == torch.float32
+    assert torch.isfinite(loss)
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()

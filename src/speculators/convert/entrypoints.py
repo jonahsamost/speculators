@@ -7,6 +7,7 @@ research repositories:
 - EAGLE3
 - MTP
 - DFlash
+- native DeepSeek V4 DSpark
 
 Functions:
     convert_model: Converts a model checkpoint to the Speculators format.
@@ -20,6 +21,7 @@ from loguru import logger
 from transformers import PretrainedConfig
 
 from speculators.convert.dflash.converter import DFlashConverter
+from speculators.convert.dsv4_dspark.converter import DSV4DSparkConverter
 from speculators.convert.eagle.eagle3_converter import Eagle3Converter
 from speculators.convert.mtp.converter import MTPConverter
 
@@ -29,7 +31,7 @@ __all__ = ["convert_model", "maybe_convert_external_checkpoint"]
 def convert_model(
     model: str,
     verifier: str,
-    algorithm: Literal["eagle3", "mtp", "dflash"],
+    algorithm: Literal["eagle3", "mtp", "dflash", "dsv4_dspark"],
     output_path: str = "converted",
     validate_device: str | None = None,
     **kwargs,
@@ -79,7 +81,7 @@ def convert_model(
     :param verifier: Verifier model checkpoint or Hugging Face model ID
         to attach as the verification/base model for speculative decoding
     :param algorithm: The conversion algorithm to use:
-        "eagle3", "mtp", or "dflash".
+        "eagle3", "mtp", "dflash", or "dsv4_dspark".
     :param output_path: Directory path where the converted model will be saved.
     :param kwargs: Additional keyword arguments for the conversion algorithm.
         Options for Eagle3: {"norm_before_residual": true,
@@ -106,6 +108,14 @@ def convert_model(
         )
     elif algorithm == "dflash":
         DFlashConverter().convert(
+            model,
+            output_path,
+            verifier,
+            validate=validate_device is not None,
+            **kwargs,
+        )
+    elif algorithm == "dsv4_dspark":
+        DSV4DSparkConverter().convert(
             model,
             output_path,
             verifier,

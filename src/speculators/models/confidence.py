@@ -14,9 +14,9 @@ __all__ = [
 class ConfidenceHead(nn.Module):
     """Project per-position draft features to one acceptance logit."""
 
-    def __init__(self, input_dim: int) -> None:
+    def __init__(self, input_dim: int, *, bias: bool = True) -> None:
         super().__init__()
-        self.proj = nn.Linear(input_dim, 1)
+        self.proj = nn.Linear(input_dim, 1, bias=bias)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         return self.proj(features).squeeze(-1)
@@ -36,10 +36,15 @@ def masked_confidence_loss(
     silently changing which draft tensors receive gradients.
     """
 
-    mask = loss_mask.to(confidence_logits.dtype)
+    # BCE's CUDA bfloat16 backward can produce NaNs for otherwise finite logits
+    # and soft targets.  Keep this small scalar-head objective in fp32; the cast
+    # backward still delivers gradients to a lower-precision producer safely.
+    logits_fp32 = confidence_logits.float()
+    targets_fp32 = acceptance_targets.detach().float().clamp(0.0, 1.0)
+    mask = loss_mask.float()
     elementwise = functional.binary_cross_entropy_with_logits(
-        confidence_logits,
-        acceptance_targets.to(confidence_logits.dtype),
+        logits_fp32,
+        targets_fp32,
         reduction="none",
     )
     if weights is not None:

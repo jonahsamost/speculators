@@ -60,7 +60,9 @@ class DSparkDraftModel(DFlashDraftModel):
             input_dim = hidden_size + (
                 config.markov_rank if config.confidence_head_with_markov else 0
             )
-            self.confidence_head = ConfidenceHead(input_dim)
+            self.confidence_head = ConfidenceHead(
+                input_dim, bias=config.confidence_head_bias
+            )
 
     @classmethod
     def from_training_args(
@@ -87,6 +89,7 @@ class DSparkDraftModel(DFlashDraftModel):
                 if confidence_head_with_markov_arg is None
                 else confidence_head_with_markov_arg
             ),
+            confidence_head_bias=kwargs.get("confidence_head_bias", True),
         )
 
         model = cls(config=config)
@@ -192,7 +195,11 @@ class DSparkDraftModel(DFlashDraftModel):
                 )
             else:
                 conf_features = hidden_blocks
-            confidence_logits = self.confidence_head(conf_features).reshape(
+            # The confidence objective calibrates a readout of drafter state; it
+            # must not reshape the drafter itself. Besides preserving token-loss
+            # optimization, this avoids sending auxiliary BCE gradients through
+            # the numerically sensitive mHC Sinkhorn stack.
+            confidence_logits = self.confidence_head(conf_features.detach()).reshape(
                 1, mask_tokens_size
             )
 

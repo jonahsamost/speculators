@@ -1,8 +1,10 @@
 import json
 import logging
+import os
 import time
 import warnings
 from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Literal, NamedTuple
 
@@ -40,6 +42,64 @@ from speculators.train.utils import normalize_counted_metrics
 
 root_logger = logging.getLogger("speculators")
 metric_logger = logging.getLogger("speculators.metrics")
+
+
+def _ensure_fp32_master_weights(model: SpeculatorModel) -> None:
+    """Keep optimizer-owned parameters in fp32 regardless of checkpoint dtype.
+
+    ``from_pretrained`` preserves the dtype stored in a checkpoint.  Released
+    draft checkpoints are commonly bf16, but constructing AdamW directly over
+    bf16 parameters also makes its moment buffers bf16.  In particular, the
+    default AdamW epsilon (1e-8) underflows to zero and a first update can turn
+    zero-gradient parameter elements into NaNs.  FSDP/DDP mixed precision casts
+    these fp32 master weights for forward compute, so promoting here does not
+    change the configured compute dtype.
+    """
+    non_fp32 = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.is_floating_point() and parameter.dtype != torch.float32
+    ]
+    if not non_fp32:
+        return
+
+    root_logger.info(
+        "Promoting %d parameter tensors to fp32 master weights before optimizer "
+        "construction.",
+        len(non_fp32),
+    )
+    model.float()
+
+
+def _nonfinite_gradient_names(model: SpeculatorModel) -> list[str]:
+    """Return parameter names whose local gradient shard is not finite."""
+    bad_names: list[str] = []
+    for name, parameter in model.named_parameters():
+        gradient = parameter.grad
+        if gradient is None:
+            continue
+        # FSDP2 gradients are DTensors.  Inspecting the local shard avoids an
+        # unnecessary all-gather while still identifying the owning parameter.
+        local_gradient = (
+            gradient.to_local() if hasattr(gradient, "to_local") else gradient
+        )
+        if not torch.isfinite(local_gradient).all().item():
+            bad_names.append(name)
+    return bad_names
+
+
+def _clip_grad_norm_or_raise(model: SpeculatorModel, max_norm: float) -> None:
+    """Clip gradients, reporting offending parameters before any optimizer step."""
+    try:
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(), max_norm, error_if_nonfinite=True
+        )
+    except RuntimeError as error:
+        bad_names = _nonfinite_gradient_names(model)
+        raise FloatingPointError(
+            "Non-finite gradient norm before the optimizer step. "
+            f"Parameters with non-finite local gradients: {bad_names}"
+        ) from error
 
 
 def _all_reduce_metrics(metrics: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -327,6 +387,11 @@ class Trainer:
         # Verify model is compatible with training infrastructure
         SpeculatorModel.verify_training_compatible(self.model)
 
+        # A pretrained checkpoint may have been serialized in bf16.  Training
+        # still requires fp32 master weights; autocast/FSDP controls the lower
+        # precision used for forward and backward compute.
+        _ensure_fp32_master_weights(self.model)
+
         # Enable gradient checkpointing BEFORE FSDP/DDP wrapping to save
         # activation memory at the cost of recomputation during backward.
         # Each decoder layer's forward is checkpointed: only the layer input
@@ -362,7 +427,7 @@ class Trainer:
         if not load_checkpoint and dist.get_rank() == 0:
             full_state_dict = self.model.state_dict()
 
-        apply_fully_sharded(self.model, param_dtype=self.config.hidden_states_dtype)
+        apply_fully_sharded(self.model)
 
         if load_checkpoint:
             self.checkpointer.load_model_state_dict(self.model)
@@ -547,9 +612,15 @@ class Trainer:
 
             timer.mark("fwd")
             self._optimizers_zero_grad()
-            loss.backward()
+            anomaly_context = (
+                torch.autograd.detect_anomaly(check_nan=True)
+                if os.environ.get("SPECULATORS_DETECT_ANOMALY") == "1"
+                else nullcontext()
+            )
+            with anomaly_context:
+                loss.backward()
             timer.mark("pre_clip")
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            _clip_grad_norm_or_raise(self.model, 1.0)
 
             metrics["error_records_sum"] = torch.tensor(
                 batch["error_records"], dtype=torch.float32, device=loss.device
@@ -747,6 +818,11 @@ class Trainer:
     def run_training(self):
         n_epochs = self.config.num_epochs
         for epoch in range(self.current_epoch, n_epochs):
+            if (
+                self.config.max_steps is not None
+                and self.global_step >= self.config.max_steps
+            ):
+                break
             root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} started")
             self.train_epoch(epoch)
             root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} completed")

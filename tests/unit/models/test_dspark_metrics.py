@@ -166,6 +166,28 @@ class TestComputeMetrics:
         )
         assert float(loss_conf) > float(loss_no_conf)
 
+    def test_bfloat16_confidence_backward_is_finite(self):
+        logits = torch.randn(1, 4, 16)
+        targets = torch.randn(1, 4, 16)
+        confidence_logits = torch.tensor(
+            [[20.0, -20.0, 0.0, 1.0]], dtype=torch.bfloat16, requires_grad=True
+        )
+        loss_mask = torch.ones(1, 4)
+
+        loss, metrics = compute_metrics(
+            logits,
+            targets,
+            confidence_logits,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+        )
+        loss.backward()
+
+        assert metrics["confidence_loss_sum"].dtype == torch.float32
+        assert confidence_logits.grad is not None
+        assert torch.isfinite(confidence_logits.grad).all()
+
     @pytest.mark.parametrize("sample_from_anchor", [False, True])
     @pytest.mark.parametrize("gamma", [1.0, 4.0])
     def test_confidence_loss_keeps_fixed_decay(self, seed, sample_from_anchor, gamma):

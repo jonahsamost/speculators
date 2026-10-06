@@ -13,6 +13,7 @@ class AlgorithmChoice(str, Enum):
     eagle3 = "eagle3"
     mtp = "mtp"
     dflash = "dflash"
+    dsv4_dspark = "dsv4_dspark"
 
 
 def convert(
@@ -101,6 +102,15 @@ def convert(
         speculators convert "z-lab/Qwen3-8B-DFlash-b16" \\
             --algorithm dflash \\
             --verifier "Qwen/Qwen3-8B"
+
+    \b
+    algorithm=="dsv4_dspark":
+        Native DeepSeek V4.1 DSpark embedded under ``mtp.*``:
+        ::
+        speculators convert /models/DeepSeek-V4.1-Flash \\
+            --algorithm dsv4_dspark \\
+            --verifier /models/DeepSeek-V4.1-Flash-speculators \\
+            --output-path /models/DeepSeek-V4.1-Flash-DSpark-trainable
     """
     if not algorithm_kwargs:
         algorithm_kwargs = {}

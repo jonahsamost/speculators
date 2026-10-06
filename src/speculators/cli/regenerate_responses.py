@@ -811,7 +811,12 @@ async def _worker(  # noqa: C901
             endpoint,
             messages,
             tools,
-            truncate_prompt_tokens=max_sequence_length,
+            # vLLM's chat render route still validates that at least one token
+            # remains available for generation. Keep that single-token
+            # headroom while measuring overlong prompts for turn-aware trim.
+            truncate_prompt_tokens=(
+                max_sequence_length - 1 if max_sequence_length is not None else None
+            ),
         )
 
     while True:

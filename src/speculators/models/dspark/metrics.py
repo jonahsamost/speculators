@@ -93,7 +93,7 @@ def compute_metrics(
     # Analytical per-position acceptance rate = distributional overlap
     # = 1 - TV; the fused kernel avoids the two full-vocab fp32 softmaxes.
     with torch.no_grad():
-        accept_rate = 1.0 - tv_loss_fn(logits, targets)  # [1, T]
+        accept_rate = (1.0 - tv_loss_fn(logits, targets)).float().clamp(0.0, 1.0)
         # Per-block cumulative acceptance product over the draft slots (slot 0
         # is the anchor), shared by the accept-length and calibration metrics.
         num_blocks = seq_len // block_size
@@ -105,9 +105,12 @@ def compute_metrics(
 
     metrics: dict[str, Any] = {}
     if confidence_logits is not None:
-        c_star = accept_rate.detach().to(confidence_logits.dtype)
+        # Keep confidence BCE in fp32. CUDA's bfloat16 BCE backward can return
+        # NaNs even when its logits, soft targets, and forward loss are finite.
+        confidence_logits_fp32 = confidence_logits.float()
+        c_star = accept_rate.detach()
         bce = binary_cross_entropy_with_logits(
-            confidence_logits, c_star, reduction="none"
+            confidence_logits_fp32, c_star, reduction="none"
         )  # [1, T]
         # D-PACE expects token CE, so keep the confidence BCE on fixed decay.
         confidence_decay_fn = partial(
@@ -119,7 +122,7 @@ def compute_metrics(
         with torch.no_grad():
             mask_f = loss_mask.to(accept_rate.dtype)
             mask_total = mask_f.sum().clamp_min(1.0)
-            conf_prob = confidence_logits.float().sigmoid()
+            conf_prob = confidence_logits_fp32.sigmoid()
             metrics["confidence_loss_sum"] = conf_loss.detach().clone()
             metrics["confidence_loss_total"] = torch.ones((), device=device)
             metrics["confidence_abs_error_sum"] = (
