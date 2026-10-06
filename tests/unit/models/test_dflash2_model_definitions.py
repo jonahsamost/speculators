@@ -277,6 +277,19 @@ def test_model_uses_canonical_checkpoint_keys():
     assert "candidate_selector.predecessor_codebook.weight" not in state_keys
 
 
+def test_confidence_head_uses_selector_context_and_round_trips():
+    model = DFlash2DraftModel(
+        _tiny_config(
+            enable_confidence_head=True,
+            confidence_head_with_selector_context=True,
+        )
+    )
+
+    assert model.confidence_head is not None
+    assert model.confidence_head.proj.in_features == 24
+    assert "confidence_head.proj.weight" in model.state_dict()
+
+
 def test_config_round_trip_preserves_dflash2_contract(tmp_path):
     config = _tiny_config(
         speculators_config=SpeculatorsConfig(
@@ -501,6 +514,54 @@ def test_trainer_kwargs_include_selector_loss_alpha():
 
     assert train_kwargs["selector_loss_alpha"] == pytest.approx(0.25)
     assert val_kwargs["selector_loss_alpha"] == pytest.approx(0.25)
+
+
+def test_dflash2_confidence_loss_reaches_confidence_logits():
+    (
+        selector,
+        unary_logits,
+        hidden_states,
+        predecessor_ids,
+        target_ids,
+        targets,
+        loss_mask,
+    ) = _selector_objective_inputs()
+    candidate_ids = unary_logits.topk(selector.top_k, dim=-1).indices
+    training_candidate_ids, target_positions, contains_target = (
+        selector_training_candidates(candidate_ids, target_ids)
+    )
+    training_logits = selector.score_candidates(
+        unary_logits, hidden_states, predecessor_ids, training_candidate_ids
+    )
+    runtime_logits = selector.score_candidates(
+        unary_logits, hidden_states, predecessor_ids, candidate_ids
+    )
+    confidence_logits = torch.zeros(1, 4, requires_grad=True)
+    loss_config = resolve_loss_config("ce", "eager")
+    tv_loss_fn = resolve_loss_config("tv", "eager")["tv"][0]
+
+    loss, metrics = compute_dflash2_metrics(
+        unary_logits=unary_logits,
+        targets=targets,
+        training_candidate_ids=training_candidate_ids,
+        candidate_logits=training_logits,
+        target_positions=target_positions,
+        contains_target=contains_target,
+        loss_mask=loss_mask,
+        block_size=4,
+        top_k=selector.top_k,
+        loss_config=loss_config,
+        tv_loss_fn=tv_loss_fn,
+        runtime_candidate_ids=candidate_ids,
+        runtime_candidate_logits=runtime_logits,
+        confidence_logits=confidence_logits,
+    )
+    loss.backward()
+
+    assert confidence_logits.grad is not None
+    assert torch.count_nonzero(confidence_logits.grad) > 0
+    assert "confidence_loss_sum" in metrics
+    assert "confidence_cumprod_bias_sum" in metrics
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

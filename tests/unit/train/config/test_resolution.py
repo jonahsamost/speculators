@@ -199,6 +199,27 @@ def test_unknown_key_warns_and_is_ignored(tmp_path):
     assert cfg.flatten()["lr"] == 0.3  # the valid sibling key still applies
 
 
+def test_legacy_dspark_confidence_yaml_is_migrated(tmp_path):
+    config_path = _write(
+        tmp_path,
+        "train:\n"
+        "  speculator_type: dspark\n"
+        "  dspark:\n"
+        "    enable_confidence_head: false\n"
+        "    confidence_head_alpha: 0.25\n",
+    )
+    with pytest.warns(FutureWarning, match="confidence settings"):
+        cfg = TrainConfig.from_sources(
+            cli={"verifier_name_or_path": "m"},
+            config_path=config_path,
+            argv=["train.py"],
+        )
+
+    assert cfg.flatten()["enable_confidence_head"] is False
+    assert cfg.flatten()["confidence_head_alpha"] == pytest.approx(0.25)
+    assert cfg.provenance["enable_confidence_head"] == "yaml"
+
+
 def test_yaml_only_draft_init_conflict_is_rejected(tmp_path):
     # The conflict lives entirely in the file: from_pretrained plus a shaping flag.
     config_path = _write(

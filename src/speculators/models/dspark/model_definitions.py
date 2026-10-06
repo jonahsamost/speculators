@@ -3,6 +3,8 @@
 import torch
 from torch import nn
 
+from speculators.models.confidence import ConfidenceHead
+
 __all__ = [
     "ConfidenceHead",
     "MarkovHead",
@@ -79,14 +81,3 @@ class MarkovHead(nn.Module):
             state = gate * state + (1.0 - gate) * torch.tanh(cand_raw)
             outputs.append(self.markov_w2(torch.tanh(out_raw)))
         return torch.stack(outputs, dim=1)
-
-
-class ConfidenceHead(nn.Module):
-    """Per-position acceptance-probability predictor (linear -> scalar logit)."""
-
-    def __init__(self, input_dim: int) -> None:
-        super().__init__()
-        self.proj = nn.Linear(input_dim, 1)
-
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        return self.proj(features).squeeze(-1)

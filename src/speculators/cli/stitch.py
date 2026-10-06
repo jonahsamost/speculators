@@ -48,6 +48,7 @@ INVERSE_MTP_EXACT_REMAP = {v: k for k, v in MTP_EXACT_REMAP.items()}
 INVERSE_MTP_PREFIX_REMAP = [(dst, src) for src, dst in MTP_PREFIX_REMAP]
 
 _FROZEN_KEYS = {"embed_tokens.weight", "lm_head.weight"}
+_AUXILIARY_PREFIXES = ("confidence_head.", "confidence_step_embeddings.")
 
 _FUSED_GATE_UP_PATTERN = re.compile(r"^(.+\.experts)\.gate_up_proj$")
 _FUSED_DOWN_PATTERN = re.compile(r"^(.+\.experts)\.down_proj$")
@@ -87,6 +88,17 @@ def _filter_frozen_keys(
     weights: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
     return {k: v for k, v in weights.items() if k not in _FROZEN_KEYS}
+
+
+def _filter_auxiliary_keys(
+    weights: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Keep non-native heads in the standalone Speculators checkpoint."""
+    return {
+        key: value
+        for key, value in weights.items()
+        if not key.startswith(_AUXILIARY_PREFIXES)
+    }
 
 
 def _unfuse_moe_experts(  # noqa: C901
@@ -287,6 +299,15 @@ def stitch(
     if frozen_count:
         console.print(
             f"  Skipped [yellow]{frozen_count}[/] frozen key(s) (embed_tokens, lm_head)"
+        )
+
+    native_only_weights = _filter_auxiliary_keys(weights)
+    auxiliary_count = len(weights) - len(native_only_weights)
+    weights = native_only_weights
+    if auxiliary_count:
+        console.print(
+            f"  Kept [yellow]{auxiliary_count}[/] auxiliary confidence tensor(s) "
+            "in the standalone checkpoint (native MTP serving does not load them)"
         )
 
     weights = _unfuse_moe_experts(weights)

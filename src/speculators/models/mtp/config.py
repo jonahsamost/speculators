@@ -51,6 +51,15 @@ class MTPSpeculatorConfig(SpeculatorModelConfig):
             "speculator head instances."
         ),
     )
+    enable_confidence_head: bool = Field(
+        default=False,
+        description="Attach a per-step acceptance-confidence head.",
+    )
+    confidence_head_with_step_embedding: bool = Field(
+        default=True,
+        description="Add a learned future-step embedding before the shared "
+        "confidence projection.",
+    )
 
     @property
     def hidden_size(self) -> int:

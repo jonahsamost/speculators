@@ -6,6 +6,7 @@ from transformers import PretrainedConfig
 
 from speculators.losses import LossConfig, kl_div_loss, resolve_loss_config, tv_loss
 from speculators.model import SpeculatorModel
+from speculators.models.confidence import ConfidenceHead
 from speculators.models.dflash.config import DFlashSpeculatorConfig
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dflash2.config import DFlash2SpeculatorConfig
@@ -68,6 +69,14 @@ class DFlash2DraftModel(DFlashDraftModel):
             top_k=config.selector_top_k,
             initializer_range=initializer_range,
         )
+        self.confidence_head: ConfidenceHead | None = None
+        if config.enable_confidence_head:
+            input_dim = config.transformer_layer_config.hidden_size + (
+                config.selector_rank
+                if config.confidence_head_with_selector_context
+                else 0
+            )
+            self.confidence_head = ConfidenceHead(input_dim)
 
     def _make_decoder_layer(
         self, config: DFlashSpeculatorConfig, layer_idx: int
@@ -96,6 +105,10 @@ class DFlash2DraftModel(DFlashDraftModel):
             conv_group_size=kwargs.get("conv_group_size", 16),
             selector_rank=kwargs.get("selector_rank", 256),
             selector_top_k=kwargs.get("selector_top_k", 16),
+            enable_confidence_head=kwargs.get("enable_confidence_head", False),
+            confidence_head_with_selector_context=kwargs.get(
+                "confidence_head_with_selector_context", True
+            ),
         )
         model = cls(config=config)
         model.load_vocab_mappings(t2d, d2t)
@@ -118,6 +131,7 @@ class DFlash2DraftModel(DFlashDraftModel):
             ),
             "dpace_alpha": kwargs.get("dpace_alpha", 0.5),
             "selector_loss_alpha": kwargs.get("selector_loss_alpha", 1.0),
+            "confidence_head_alpha": kwargs.get("confidence_head_alpha", 1.0),
         }
         return dict(shared), dict(shared)
 
@@ -148,6 +162,7 @@ class DFlash2DraftModel(DFlashDraftModel):
         gamma: float = 4.0,
         max_anchors: int = 512,
         selector_loss_alpha: float = 1.0,
+        confidence_head_alpha: float = 1.0,
         per_position_loss_weight: str = "fixed-exp-decay",
         dpace_alpha: float = 0.5,
         **kwargs,
@@ -165,6 +180,7 @@ class DFlash2DraftModel(DFlashDraftModel):
             )
         )
         predecessor_ids = self._predecessor_ids(input_ids, block_indices)
+        flat_predecessor_ids = predecessor_ids.reshape(1, -1)
 
         target_ids = targets.argmax(dim=-1)
         # shape: [1, num_anchors*block_size]
@@ -176,15 +192,36 @@ class DFlash2DraftModel(DFlashDraftModel):
         candidate_logits = self.candidate_selector.score_candidates(
             unary_logits,
             hidden,
-            predecessor_ids.reshape(1, -1),
+            flat_predecessor_ids,
             training_candidate_ids,
         )
+        runtime_candidate_logits = None
+        confidence_logits = None
+        if self.confidence_head is not None:
+            runtime_candidate_logits = self.candidate_selector.score_candidates(
+                unary_logits,
+                hidden,
+                flat_predecessor_ids,
+                candidate_ids,
+            )
+            confidence_features = hidden
+            if self.config.confidence_head_with_selector_context:
+                selector_context = self.candidate_selector.context(
+                    hidden, flat_predecessor_ids
+                )
+                confidence_features = torch.cat(
+                    [hidden, selector_context.to(hidden.dtype)], dim=-1
+                )
+            confidence_logits = self.confidence_head(confidence_features)
 
         loss, metrics = compute_metrics(
             unary_logits=unary_logits,
             targets=targets,
             training_candidate_ids=training_candidate_ids,
             candidate_logits=candidate_logits,
+            runtime_candidate_ids=candidate_ids,
+            runtime_candidate_logits=runtime_candidate_logits,
+            confidence_logits=confidence_logits,
             target_positions=target_positions,
             contains_target=contains_target,
             loss_mask=aligned_loss_mask,
@@ -195,6 +232,7 @@ class DFlash2DraftModel(DFlashDraftModel):
             tv_loss_fn=tv_loss_fn,
             gamma=gamma,
             selector_loss_alpha=selector_loss_alpha,
+            confidence_head_alpha=confidence_head_alpha,
             per_position_loss_weight=per_position_loss_weight,
             dpace_alpha=dpace_alpha,
         )

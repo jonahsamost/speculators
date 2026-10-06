@@ -3,11 +3,69 @@
 import math
 
 import torch
+from torch import nn
+from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
+from speculators import SpeculatorsConfig, VerifierConfig
+from speculators.losses.eager import tv_loss
+from speculators.models.mtp import MTPDraftModel, MTPSpeculatorConfig
 from speculators.models.mtp.core import _prepare_mtp_position_ids
+from speculators.proposals import GreedyTokenProposalConfig
 
 BATCH = 1
 SEQ_LEN = 10
+
+
+def _tiny_confidence_model() -> MTPDraftModel:
+    transformer_config = Qwen3Config(
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        vocab_size=32,
+        _attn_implementation="eager",  # type: ignore[call-arg]
+    )
+    config = MTPSpeculatorConfig(
+        transformer_layer_config=transformer_config,
+        speculators_config=SpeculatorsConfig(
+            algorithm="mtp",
+            proposal_methods=[GreedyTokenProposalConfig(speculative_tokens=2)],
+            default_proposal_method="greedy",
+            verifier=VerifierConfig(
+                name_or_path=None,
+                architectures=["Qwen3ForCausalLM"],
+            ),
+        ),
+        enable_confidence_head=True,
+        confidence_head_with_step_embedding=True,
+    )
+    model = MTPDraftModel(config)
+    nn.init.normal_(model.embed_tokens.weight, std=0.02)
+    nn.init.normal_(model.lm_head.weight, std=0.02)
+    return model
+
+
+def test_mtp_confidence_head_trains_with_step_embeddings(seed):
+    model = _tiny_confidence_model()
+    input_ids = torch.randint(0, model.config.vocab_size, (1, 8))
+    hidden_states = torch.randn(1, 8, model.config.hidden_size)
+
+    _, loss, metrics = model(
+        input_ids=input_ids,
+        hidden_states=hidden_states,
+        loss_mask=torch.ones_like(input_ids),
+        tv_loss_fn=tv_loss,
+    )
+    loss.backward()
+
+    assert model.confidence_head is not None
+    assert model.confidence_head.proj.weight.grad is not None
+    assert model.confidence_step_embeddings is not None
+    assert model.confidence_step_embeddings.weight.grad is not None
+    assert "confidence_loss_sum" in metrics
+    assert "confidence_cumprod_bias_sum" in metrics
 
 
 def test_qwen35_position_ids_are_expanded_for_new_transformers():

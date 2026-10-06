@@ -1,6 +1,7 @@
 """MTP speculator model implementation."""
 
 import logging
+from collections.abc import Callable
 from typing import Any, ClassVar
 
 import torch
@@ -10,7 +11,9 @@ from transformers.masking_utils import create_causal_mask
 
 from speculators import SpeculatorModel
 from speculators.config import SpeculatorsConfig, VerifierConfig
+from speculators.losses import resolve_loss_config, tv_loss
 from speculators.model import DraftVocabMixin
+from speculators.models.confidence import ConfidenceHead, masked_confidence_loss
 from speculators.models.mtp.config import MTPSpeculatorConfig
 from speculators.models.mtp.model_definitions import (
     mtp_model_classes,
@@ -130,6 +133,14 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
         self.rotary_emb = self._model_definitions.rotary_emb_class(
             flatten_rope_parameters(tc)
         )
+        self.confidence_head: ConfidenceHead | None = None
+        self.confidence_step_embeddings: nn.Embedding | None = None
+        if config.enable_confidence_head:
+            self.confidence_head = ConfidenceHead(tc.hidden_size)
+            if config.confidence_head_with_step_embedding:
+                self.confidence_step_embeddings = nn.Embedding(
+                    config.num_speculative_steps, tc.hidden_size
+                )
 
         self.post_init()
 
@@ -163,6 +174,8 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
         position_ids: torch.Tensor | None = None,
         loss_mask: torch.Tensor | None = None,
         step_weights: list[float] | None = None,
+        confidence_head_alpha: float = 1.0,
+        tv_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = tv_loss,
         return_dict: bool = True,  # noqa: ARG002
         **kwargs: Any,  # noqa: ARG002
     ) -> tuple:
@@ -211,6 +224,10 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
         all_logits: list[torch.Tensor] = []
         total_loss = torch.tensor(0.0, device=device)
         metrics: dict[str, float | torch.Tensor] = {}
+        confidence_losses: list[torch.Tensor] = []
+        confidence_probabilities: list[torch.Tensor] = []
+        confidence_targets: list[torch.Tensor] = []
+        confidence_masks: list[torch.Tensor] = []
 
         # Uniform valid_len keeps tensor shapes identical across loop
         # iterations, which torch.compile requires for stable codegen.
@@ -271,7 +288,69 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
             total_loss = total_loss + step_loss
             metrics[f"loss_step_{step}"] = step_loss.detach().clone()
 
+            if self.confidence_head is not None:
+                confidence_features = mtp_output
+                if self.confidence_step_embeddings is not None:
+                    confidence_features = confidence_features + (
+                        self.confidence_step_embeddings.weight[step]
+                        .to(confidence_features.dtype)
+                        .view(1, 1, -1)
+                    )
+                confidence_logits = self.confidence_head(confidence_features)
+                with torch.no_grad():
+                    verifier_logits = self.lm_head(
+                        hidden_states[:, step + 1 : step + 1 + valid_len]
+                    )
+                    acceptance_target = 1.0 - tv_loss_fn(logits, verifier_logits)
+                confidence_mask = step_targets.ne(_IGNORE_INDEX)
+                confidence_loss = masked_confidence_loss(
+                    confidence_logits,
+                    acceptance_target.detach(),
+                    confidence_mask,
+                )
+                weighted_confidence_loss = weight * confidence_loss
+                total_loss = (
+                    total_loss + confidence_head_alpha * weighted_confidence_loss
+                )
+                metrics[f"confidence_loss_step_{step}"] = (
+                    weighted_confidence_loss.detach().clone()
+                )
+                confidence_losses.append(weighted_confidence_loss)
+                confidence_probabilities.append(
+                    confidence_logits.detach().float().sigmoid()
+                )
+                confidence_targets.append(acceptance_target)
+                confidence_masks.append(confidence_mask)
+
             current_hidden = mtp_output
+
+        if confidence_losses:
+            confidence_loss = torch.stack(confidence_losses).sum()
+            confidence_prob = torch.stack(confidence_probabilities, dim=-1)
+            confidence_target = torch.stack(confidence_targets, dim=-1)
+            confidence_mask = torch.stack(confidence_masks, dim=-1)
+            mask_float = confidence_mask.to(confidence_target.dtype)
+            mask_total = mask_float.sum().clamp_min(1.0)
+            metrics["confidence_loss_sum"] = confidence_loss.detach().clone()
+            metrics["confidence_loss_total"] = torch.ones((), device=device)
+            metrics["confidence_abs_error_sum"] = (
+                (confidence_prob - confidence_target).abs() * mask_float
+            ).sum()
+            metrics["confidence_abs_error_total"] = mask_total
+            metrics["confidence_pred_mean_sum"] = (confidence_prob * mask_float).sum()
+            metrics["confidence_pred_mean_total"] = mask_total.clone()
+            metrics["confidence_target_mean_sum"] = (
+                confidence_target * mask_float
+            ).sum()
+            metrics["confidence_target_mean_total"] = mask_total.clone()
+
+            prefix_mask = confidence_mask.cumprod(dim=-1).to(confidence_target.dtype)
+            predicted_prefix = (confidence_prob * mask_float).cumprod(dim=-1)
+            target_prefix = (confidence_target * mask_float).cumprod(dim=-1)
+            metrics["confidence_cumprod_bias_sum"] = (
+                (predicted_prefix - target_prefix) * prefix_mask
+            ).sum()
+            metrics["confidence_cumprod_bias_total"] = prefix_mask.sum().clamp_min(1.0)
 
         metrics["loss_sum"] = total_loss.detach().clone()
         metrics["loss_total"] = torch.tensor(1.0, device=device)
@@ -285,7 +364,7 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
         *,
         num_speculative_steps: int = 3,
         verifier_name_or_path: str | None = None,
-        **kwargs: Any,  # noqa: ARG003
+        **kwargs: Any,
     ) -> "MTPDraftModel":
         if verifier_name_or_path is None:
             raise ValueError(
@@ -310,6 +389,10 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
                 # composite verifiers (e.g. Qwen3.5-MoE), which carries no
                 # architectures -- leaving verifier.architectures empty.
                 verifier=VerifierConfig.from_pretrained(verifier_name_or_path),
+            ),
+            enable_confidence_head=kwargs.get("enable_confidence_head", False),
+            confidence_head_with_step_embedding=kwargs.get(
+                "confidence_head_with_step_embedding", True
             ),
         )
 
@@ -347,6 +430,13 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
                 num_steps=kwargs["num_speculative_steps"],
             )
         train_kwargs: dict[str, Any] = {"step_weights": step_weights}
+        implementation = kwargs.get("loss_implementation", "fused")
+        train_kwargs.update(
+            {
+                "confidence_head_alpha": kwargs.get("confidence_head_alpha", 1.0),
+                "tv_loss_fn": resolve_loss_config("tv", implementation)["tv"][0],
+            }
+        )
         val_kwargs = train_kwargs.copy()
 
         return train_kwargs, val_kwargs

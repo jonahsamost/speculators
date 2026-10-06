@@ -7,8 +7,10 @@ import pytest
 from speculators import losses
 from speculators.losses import eager
 from speculators.models.dflash.core import DFlashDraftModel
+from speculators.models.dflash2.core import DFlash2DraftModel
 from speculators.models.dspark.core import DSparkDraftModel
 from speculators.models.eagle3.core import Eagle3DraftModel
+from speculators.models.mtp.core import MTPDraftModel
 from speculators.models.peagle.core import PEagleDraftModel
 from speculators.train.config import TrainConfig
 
@@ -136,6 +138,36 @@ def test_dspark_confidence_head_alpha(monkeypatch):
     train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
     assert train_kw["confidence_head_alpha"] == 0.5
     assert val_kw["confidence_head_alpha"] == 0.5
+
+
+def test_confidence_defaults_and_algorithm_overrides(monkeypatch):
+    dspark = _parse(monkeypatch, ["--speculator-type", "dspark"])
+    dflash2 = _parse(monkeypatch, ["--speculator-type", "dflash2"])
+    mtp = _parse(
+        monkeypatch,
+        ["--speculator-type", "mtp", "--enable-confidence-head"],
+    )
+
+    assert dspark.enable_confidence_head is True
+    assert dflash2.enable_confidence_head is False
+    assert mtp.enable_confidence_head is True
+
+
+def test_dflash2_and_mtp_receive_confidence_alpha(monkeypatch):
+    dflash2 = _parse(
+        monkeypatch,
+        ["--speculator-type", "dflash2", "--confidence-head-alpha", "0.25"],
+    )
+    mtp = _parse(
+        monkeypatch,
+        ["--speculator-type", "mtp", "--confidence-head-alpha", "0.75"],
+    )
+
+    dflash_train, _ = DFlash2DraftModel.get_trainer_kwargs(**vars(dflash2))
+    mtp_values = vars(mtp) | {"num_speculative_steps": 3}
+    mtp_train, _ = MTPDraftModel.get_trainer_kwargs(**mtp_values)
+    assert dflash_train["confidence_head_alpha"] == pytest.approx(0.25)
+    assert mtp_train["confidence_head_alpha"] == pytest.approx(0.75)
 
 
 # ---------------------------------------------------------------------------

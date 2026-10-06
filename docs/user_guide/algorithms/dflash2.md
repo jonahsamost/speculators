@@ -31,6 +31,14 @@ The public DFlash2 implementation specifies inference but does not publish its t
 
 `--selector-loss-alpha` controls the second term. Both terms use the configured fixed exponential or D-PACE position weighting. The selector is never trained against a full-vocabulary corrected distribution, matching the candidate set it can rerank at serving time.
 
+An optional confidence head (`--enable-confidence-head`) is trained jointly from
+the same runtime top-K proposal distribution. Its soft target is the exact
+distributional overlap `sum_v min(q_v, p_v)`, with `q` normalized over the
+selector-supported candidates and `p` normalized over the verifier's full
+vocabulary. The injected target used to make selector CE trainable is deliberately
+excluded from this target. By default the head also receives the selector context;
+disable that with `--no-confidence-head-with-selector-context`.
+
 Validation reports clearly separated unary candidate recall and target mass, teacher-forced selector accuracy, and an actual greedy self-conditioned path. The path begins at the verified anchor and feeds each selected token to the next edge score. Its per-position accuracy is conditioned on the earlier path being correct. The accepted-length metrics include the verified anchor and report both the realized selector path and the oracle unary-top-K path.
 
 DFlash2 currently requires the full verifier vocabulary. Pruned draft vocabularies are rejected because current serving implementations select candidates before any draft-to-target vocabulary mapping.
@@ -46,6 +54,8 @@ This experimental implementation directly trains full-vocabulary predecessor and
 | `--selector-rank`       |     256 | Rank of the transition factorization     |
 | `--selector-top-k`      |      16 | Unary candidates reranked per position   |
 | `--selector-loss-alpha` |     1.0 | Weight of the selector K-way CE term     |
+| `--enable-confidence-head` | disabled | Train the auxiliary acceptance head   |
+| `--confidence-head-alpha` |     1.0 | Weight of its soft-target BCE           |
 
 All [DFlash](dflash.md) backbone parameters also apply. DFlash2 defaults to five draft layers, block size 8, `sample_from_anchor: False`, fixed exponential position weighting, and KL divergence loss. Set all shared knobs explicitly when comparing it with another algorithm.
 

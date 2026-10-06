@@ -11,10 +11,11 @@ from speculators.losses import (
     tv_loss,
 )
 from speculators.model import SpeculatorModel
+from speculators.models.confidence import ConfidenceHead
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.config import DSparkSpeculatorConfig
 from speculators.models.dspark.metrics import compute_metrics
-from speculators.models.dspark.model_definitions import ConfidenceHead, MarkovHead
+from speculators.models.dspark.model_definitions import MarkovHead
 from speculators.models.utils import conditional_torch_compile
 
 _DEFAULT_LOSS_CONFIG: LossConfig = {"kl_div": (kl_div_loss, 1.0)}

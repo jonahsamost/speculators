@@ -506,6 +506,11 @@ class DFlash2Args(_Group):
         ge=0.0,
         description="DFlash2: weight of the candidate-selector K-way CE term.",
     )
+    confidence_head_with_selector_context: bool = Field(
+        default=True,
+        description="DFlash2: feed selector context into the confidence head "
+        "alongside the draft hidden state.",
+    )
 
 
 class DSparkArgs(_Group):
@@ -519,17 +524,25 @@ class DSparkArgs(_Group):
     markov_head_type: Literal["vanilla", "gated", "rnn"] = Field(
         default="vanilla", description="DSpark: sequential head variant."
     )
-    enable_confidence_head: bool = Field(
-        default=True,
-        description="DSpark: attach the per-position acceptance confidence head.",
-    )
     confidence_head_with_markov: bool = Field(
         default=True,
         description="DSpark: feed the Markov previous-token embedding into the "
         "confidence head alongside the backbone hidden state.",
     )
+
+
+class ConfidenceArgs(_Group):
+    """Acceptance-confidence training shared by supported speculators."""
+
+    enable_confidence_head: bool | None = Field(
+        default=None,
+        description="Attach a per-position acceptance-confidence head. Defaults to "
+        "enabled for DSpark and disabled for other algorithms.",
+    )
     confidence_head_alpha: float = Field(
-        default=1.0, description="DSpark: weight of the confidence-head BCE term."
+        default=1.0,
+        ge=0.0,
+        description="Weight of the acceptance-confidence BCE term.",
     )
 
 
@@ -608,6 +621,11 @@ class MTPArgs(_Group):
         description="Exponential decay factor for MTP step weights; higher weights "
         "earlier prediction steps more. Only used with MTP.",
     )
+    confidence_head_with_step_embedding: bool = Field(
+        default=True,
+        description="MTP: add a learned future-step embedding before the shared "
+        "confidence projection.",
+    )
 
 
 # Group attribute name -> group model. Order defines both the flatten() key order
@@ -625,6 +643,7 @@ _GROUPS: dict[str, type[_Group]] = {
     "dflash": DFlashArgs,
     "dflash2": DFlash2Args,
     "dspark": DSparkArgs,
+    "confidence": ConfidenceArgs,
     "xpress": XPressArgs,
     "peagle": PEagleArgs,
     "mtp": MTPArgs,
@@ -749,9 +768,10 @@ class TrainConfig(BaseSettings):
     xpress: XPressArgs = Field(default_factory=XPressArgs)
     peagle: PEagleArgs = Field(default_factory=PEagleArgs)
     mtp: MTPArgs = Field(default_factory=MTPArgs)
+    confidence: ConfidenceArgs = Field(default_factory=ConfidenceArgs)
 
     @model_validator(mode="after")
-    def _resolve_derived_defaults(self) -> "TrainConfig":
+    def _resolve_derived_defaults(self) -> "TrainConfig":  # noqa: C901
         """Fill defaults that derive from other fields, mirroring the tail of the
         pre-refactor ``parse_args``: unset ``draft_arch`` -> ``llama`` for eagle3 else
         ``qwen3``; unset ``norm_before_fc`` / ``norm_output`` -> ``True`` for eagle3
@@ -809,6 +829,8 @@ class TrainConfig(BaseSettings):
             self.loss.loss_fn = _DEFAULT_LOSS_FN.get(self.speculator_type, "kl_div")
         if self.dflash.block_size is None:
             self.dflash.block_size = _DEFAULT_BLOCK_SIZE.get(self.speculator_type, 8)
+        if self.confidence.enable_confidence_head is None:
+            self.confidence.enable_confidence_head = self.speculator_type == "dspark"
         return self
 
     @model_validator(mode="after")

@@ -96,6 +96,7 @@ _ALGORITHM_GROUP_USERS: dict[str, frozenset[str]] = {
     "dflash": frozenset({"dflash", "dflash2", "dspark", "xpress"}),
     "dflash2": frozenset({"dflash2"}),
     "dspark": frozenset({"dspark"}),
+    "confidence": frozenset({"dflash2", "dspark", "mtp"}),
     "xpress": frozenset({"xpress"}),
     "peagle": frozenset({"peagle"}),
     "mtp": frozenset({"mtp"}),
@@ -416,6 +417,7 @@ def build_from_sources(
     yaml_dests: set[str] = set()
     if config_path is not None:
         yaml_nested = _unwrap_stage(_load_config_file(config_path))
+        _migrate_legacy_confidence_yaml(yaml_nested)
         yaml_dests, unknown = _partition_yaml_keys(yaml_nested)
         if unknown:
             warnings.warn(
@@ -456,6 +458,36 @@ def build_from_sources(
     _validate_draft_init(cfg, provided)
     _validate_required(cfg)
     return cfg
+
+
+def _migrate_legacy_confidence_yaml(yaml_nested: dict[str, Any]) -> None:
+    """Move pre-shared DSpark confidence fields to the confidence group.
+
+    Confidence settings originally lived under ``dspark:``. Keep existing
+    run.yaml files replayable after DFlash2 and MTP begin sharing those knobs.
+    An explicitly supplied value in the new group wins if both spellings exist.
+    """
+    dspark = yaml_nested.get("dspark")
+    if not isinstance(dspark, dict):
+        return
+
+    legacy_fields = ("enable_confidence_head", "confidence_head_alpha")
+    moved = [field for field in legacy_fields if field in dspark]
+    if not moved:
+        return
+
+    confidence = yaml_nested.setdefault("confidence", {})
+    if not isinstance(confidence, dict):
+        # Let pydantic report the malformed new group instead of hiding it.
+        return
+    for field in moved:
+        confidence.setdefault(field, dspark.pop(field))
+    warnings.warn(
+        "confidence settings under 'dspark:' are deprecated; move "
+        f"{', '.join(moved)} to 'confidence:'",
+        FutureWarning,
+        stacklevel=3,
+    )
 
 
 def _validate_required(cfg: TrainConfig) -> None:

@@ -18,6 +18,10 @@ from speculators.losses import (
     loss_function,
     tv_loss,
 )
+from speculators.models.confidence import (
+    masked_confidence_loss,
+    sparse_distribution_overlap,
+)
 from speculators.models.dspark.metrics import compute_metrics as compute_unary_metrics
 from speculators.models.metrics import compute_accepted_length_counts
 
@@ -125,9 +129,13 @@ def compute_metrics(
     sample_from_anchor: bool = False,
     *,
     loss_config: LossConfig,
+    runtime_candidate_ids: torch.Tensor | None = None,
+    runtime_candidate_logits: torch.Tensor | None = None,
+    confidence_logits: torch.Tensor | None = None,
     tv_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = tv_loss,
     gamma: float = 4.0,
     selector_loss_alpha: float = 1.0,
+    confidence_head_alpha: float = 1.0,
     per_position_loss_weight: str = "fixed-exp-decay",
     dpace_alpha: float = 0.5,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -158,11 +166,70 @@ def compute_metrics(
     )
     loss = unary_loss + selector_loss_alpha * selector_loss
 
+    confidence_target = None
+    confidence_loss = None
+    if confidence_logits is not None:
+        if runtime_candidate_ids is None or runtime_candidate_logits is None:
+            raise ValueError(
+                "runtime candidate ids and logits are required with confidence logits"
+            )
+        with torch.no_grad():
+            confidence_target = sparse_distribution_overlap(
+                runtime_candidate_ids,
+                runtime_candidate_logits,
+                targets,
+            )
+        pos_idx = (
+            torch.arange(confidence_logits.shape[1], device=confidence_logits.device)
+            % block_size
+        ).unsqueeze(0)
+        confidence_weights = dflash_loss_decay(
+            pos_idx.to(confidence_logits.dtype),
+            gamma=gamma,
+            sample_from_anchor=sample_from_anchor,
+        )
+        confidence_loss = masked_confidence_loss(
+            confidence_logits,
+            confidence_target.detach(),
+            loss_mask,
+            weights=confidence_weights,
+        )
+        loss = loss + confidence_head_alpha * confidence_loss
+
     one = torch.ones((), device=unary_logits.device)
     metrics["unary_loss_sum"] = unary_loss.detach().clone()
     metrics["unary_loss_total"] = one
     metrics["selector_loss_sum"] = selector_loss.detach().clone()
     metrics["selector_loss_total"] = one.clone()
+    if confidence_loss is not None and confidence_target is not None:
+        assert confidence_logits is not None  # noqa: S101 - narrowed by construction
+        valid_float = loss_mask.to(confidence_target.dtype)
+        valid_total = valid_float.sum().clamp_min(1.0)
+        confidence_prob = confidence_logits.detach().float().sigmoid()
+        metrics["confidence_loss_sum"] = confidence_loss.detach().clone()
+        metrics["confidence_loss_total"] = one.clone()
+        metrics["confidence_abs_error_sum"] = (
+            (confidence_prob - confidence_target).abs() * valid_float
+        ).sum()
+        metrics["confidence_abs_error_total"] = valid_total
+        metrics["confidence_pred_mean_sum"] = (confidence_prob * valid_float).sum()
+        metrics["confidence_pred_mean_total"] = valid_total.clone()
+        metrics["confidence_target_mean_sum"] = (confidence_target * valid_float).sum()
+        metrics["confidence_target_mean_total"] = valid_total.clone()
+
+        start_pos = 0 if sample_from_anchor else 1
+        num_blocks = confidence_logits.shape[1] // block_size
+        block_mask = valid_float.view(num_blocks, block_size)[:, start_pos:]
+        predicted_prefix = (
+            confidence_prob.view(num_blocks, block_size)[:, start_pos:] * block_mask
+        ).cumprod(dim=-1)
+        target_prefix = (
+            confidence_target.view(num_blocks, block_size)[:, start_pos:] * block_mask
+        ).cumprod(dim=-1)
+        metrics["confidence_cumprod_bias_sum"] = (
+            (predicted_prefix - target_prefix) * block_mask
+        ).sum()
+        metrics["confidence_cumprod_bias_total"] = block_mask.sum().clamp_min(1.0)
     metrics["loss_sum"] = loss.detach().clone()
     metrics["loss_total"] = one.clone()
 

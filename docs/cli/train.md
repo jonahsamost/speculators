@@ -201,6 +201,8 @@ DFlash2 builds on DFlash, so all DFlash-specific arguments apply as well. It def
 
 - **`--selector-loss-alpha`** (float, default: `1.0`) Weight of the candidate-selector K-way cross-entropy term.
 
+- **`--confidence-head-with-selector-context`** / **`--no-confidence-head-with-selector-context`** (flag, default: `True`) Concatenate the selector's predecessor-conditioned context with the draft hidden state before the confidence projection.
+
 ### DSpark-Specific Arguments
 
 DSpark builds on DFlash, so all DFlash-specific arguments apply as well.
@@ -209,11 +211,17 @@ DSpark builds on DFlash, so all DFlash-specific arguments apply as well.
 
 - **`--markov-head-type`** (str, default: `"vanilla"`) Sequential head variant. Options: `vanilla`, `gated`, `rnn`.
 
-- **`--enable-confidence-head`** / **`--no-enable-confidence-head`** (flag, default: `True`) Attach the per-position acceptance confidence head.
-
 - **`--confidence-head-with-markov`** / **`--no-confidence-head-with-markov`** (flag, default: `True`) Feed the Markov previous-token embedding into the confidence head alongside the backbone hidden state.
 
-- **`--confidence-head-alpha`** (float, default: `1.0`) Weight of the confidence-head BCE term.
+### Acceptance-Confidence Arguments
+
+DFlash2, DSpark, and MTP can jointly train a per-position head that predicts the analytical rejection-sampling acceptance probability. DSpark enables it by default; DFlash2 and MTP require the enable flag unless an experiment config enables it explicitly.
+
+- **`--enable-confidence-head`** / **`--no-enable-confidence-head`** (flag, algorithm-specific default) Attach the acceptance-confidence head.
+
+- **`--confidence-head-alpha`** (float, default: `1.0`) Weight of the soft-target confidence BCE term.
+
+- **`--confidence-head-with-step-embedding`** / **`--no-confidence-head-with-step-embedding`** (flag, default: `True`) For MTP, add a learned speculative-step embedding before the shared confidence projection.
 
 ### Sliding Window Attention Arguments
 

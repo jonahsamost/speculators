@@ -43,3 +43,12 @@ class DFlash2SpeculatorConfig(DFlashSpeculatorConfig):
         ge=1,
         description="Number of unary candidates reranked during inference.",
     )
+    enable_confidence_head: bool = Field(
+        default=False,
+        description="Attach a per-position acceptance-confidence head.",
+    )
+    confidence_head_with_selector_context: bool = Field(
+        default=True,
+        description="Concatenate the selector predecessor/hidden context with the "
+        "draft hidden state before the confidence projection.",
+    )

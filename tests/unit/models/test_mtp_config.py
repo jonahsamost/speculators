@@ -52,6 +52,8 @@ class TestConstruction:
         assert config.architectures == ["MTPDraftModel"]
         assert config.num_nextn_predict_layers == 1
         assert config.model_type == "speculator_model"
+        assert config.enable_confidence_head is False
+        assert config.confidence_head_with_step_embedding is True
 
     def test_derived_properties(self, mtp_config, qwen3_5_pretrained_config):
         assert mtp_config.hidden_size == qwen3_5_pretrained_config.hidden_size

@@ -14,7 +14,22 @@ The MTP head consists of a single prediction layer that takes two inputs at each
 2. **Train:** Finetune the MTP layers on domain-specific data. At each step k, the model predicts token t+k+1 given verifier hidden states at position t and ground-truth token embeddings at position t+k. Per-step losses are weighted with exponential decay (default beta=0.6) following FastMTP Equation 2
 3. **Stitch:** Merge the finetuned MTP weights back into the original verifier checkpoint for deployment
 
-Only the MTP layers are trainable -- `embed_tokens` and `lm_head` are frozen and shared with the verifier.
+The MTP layers (and optional confidence parameters) are trainable;
+`embed_tokens` and `lm_head` remain frozen and shared with the verifier.
+
+### Optional Confidence Head
+
+`--enable-confidence-head` jointly trains one shared linear confidence head over
+the MTP output states. The target for step `k` is the analytical distributional
+overlap between that step's draft logits and the verifier distribution aligned to
+the same future token. The verifier logits are reconstructed from the final hidden
+states already present in the training batch, so enabling this does not require a
+larger hidden-state extraction payload. A learned step embedding is added by
+default and can be disabled with `--no-confidence-head-with-step-embedding`.
+
+The confidence tensors remain in the standalone Speculators checkpoint. Current
+native MTP stitching and vLLM serving do not consume them; runtime support can be
+added independently without changing how the head is trained.
 
 ### Step Weight Formula
 
