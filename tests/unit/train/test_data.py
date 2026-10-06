@@ -234,6 +234,27 @@ def test_arrow_dataset_default_train_ratio_does_not_crash(tmp_path: Path):
     assert arrow_ds._map_to_file_idx(5) == 5
 
 
+def test_arrow_dataset_accepts_multiple_generation_endpoints(tmp_path: Path):
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1], [2]],
+            "loss_mask": [[1], [1]],
+            "seq_len": [1, 1],
+        }
+    )
+    ds.save_to_disk(str(tmp_path / "data"))
+    (tmp_path / "data" / "hidden_states").mkdir()
+
+    arrow_ds = ArrowDataset(
+        max_len=8,
+        datapath=str(tmp_path / "data"),
+        on_missing="skip",
+        vllm_endpoint="http://one/v1, http://two/v1",
+    )
+
+    assert arrow_ds.vllm_endpoints == ("http://one/v1", "http://two/v1")
+
+
 class _SequenceTransfer:
     """Minimal transfer fake which returns or raises queued generated results."""
 

@@ -158,6 +158,7 @@ class TrainerConfig(NamedTuple):
     scheduler_total_steps: int | None = None
     scheduler_num_cosine_cycles: float = 0.5
     checkpoint_freq: float = 1
+    checkpoint_steps: int | None = None
     save_best: bool = False
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
@@ -599,6 +600,14 @@ class Trainer:
                 step_callback()
 
             if (
+                self.config.checkpoint_steps is not None
+                and not self.config.save_best
+                and self.global_step % self.config.checkpoint_steps == 0
+                and local_step < num_steps
+            ):
+                self.maybe_save_checkpoint(epoch, local_step=local_step)
+
+            if (
                 self.config.max_steps is not None
                 and self.global_step >= self.config.max_steps
             ):
@@ -675,13 +684,17 @@ class Trainer:
         return val_metrics
 
     def maybe_save_checkpoint(self, epoch: int | str, local_step: int = 0):
-        if epoch != "interrupted" and (
-            self.config.save_best
-            or (
-                self.config.checkpoint_freq >= 1
-                and isinstance(epoch, int)
-                and epoch != 0
-                and (epoch + 1) % self.config.checkpoint_freq != 0
+        if (
+            epoch != "interrupted"
+            and local_step == 0
+            and (
+                self.config.save_best
+                or (
+                    self.config.checkpoint_freq >= 1
+                    and isinstance(epoch, int)
+                    and epoch != 0
+                    and (epoch + 1) % self.config.checkpoint_freq != 0
+                )
             )
         ):
             return

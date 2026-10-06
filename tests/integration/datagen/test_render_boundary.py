@@ -178,6 +178,18 @@ def test_append_boundary_rows_counts_rows_at_limit_as_maybe_truncated():
     assert preprocessing._append_boundary_rows(results, rows, 4, None) == (1, 0, 1)
 
 
+def test_pretokenized_split_survives_filtering():
+    examples = {
+        "input_ids": [[1, 2], [3, 4]],
+        "loss_mask": [[0, 0], [0, 1]],
+        "split": ["train", "validation"],
+    }
+
+    result = preprocessing._preprocess_batch(examples, False, None, 8)
+
+    assert result["split"] == ["validation"]
+
+
 # --------------------------------------------------------------------------- #
 # render_client                                                                #
 # --------------------------------------------------------------------------- #

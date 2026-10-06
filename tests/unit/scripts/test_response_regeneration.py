@@ -22,11 +22,14 @@ from speculators.cli.regenerate_responses import (
     _worker,
     build_boundary_sample,
     extract_conversation,
+    extract_teacher_targets,
     extract_tools,
     load_input_dataset,
     load_seen,
     prepare_row,
     regenerate_conversation,
+    regenerate_teacher_targets,
+    trim_teacher_prefix,
 )
 from speculators.data_generation import vllm_client
 from speculators.data_generation.configs import DATASET_CONFIGS, DatasetConfig
@@ -182,6 +185,46 @@ def test_extract_conversation_turns(row, prompt_field, expected):
 def test_extract_conversation_no_usable_input_returns_empty():
     # No conversation field and no prompt_field value -> nothing to regenerate.
     assert extract_conversation({"answer": "orphan"}, "question")[0] == []
+
+
+def test_teacher_targets_keep_original_assistant_history():
+    targets = extract_teacher_targets(_ULTRACHAT_ROW, None)
+
+    assert [index for index, _ in targets] == [1, 3]
+    assert targets[0][1] == [_ULTRACHAT_ROW["messages"][0]]
+    assert targets[1][1] == _ULTRACHAT_ROW["messages"][:3]
+
+
+def test_teacher_targets_generate_a_trailing_request():
+    row = {
+        "messages": [
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "old one"},
+            {"role": "user", "content": "two"},
+        ]
+    }
+
+    targets = extract_teacher_targets(row, None)
+
+    assert [index for index, _ in targets] == [1, 3]
+    assert targets[-1][1] == row["messages"]
+
+
+def test_teacher_truncation_drops_oldest_turn_group():
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "current question"},
+    ]
+
+    async def render(prefix, _tools):
+        return list(range(len(prefix) * 10))
+
+    trimmed, dropped = asyncio.run(trim_teacher_prefix(render, messages, None, 25))
+
+    assert trimmed == [messages[0], messages[-1]]
+    assert dropped == 2
 
 
 # ---------------------------------------------------------------------------
@@ -626,6 +669,56 @@ def _regen(
         )
     )
     return samples, truncated, sent
+
+
+def test_teacher_regeneration_uses_captured_history_and_preserves_split():
+    item = {
+        "idx": 7,
+        "primary_id": "conversation",
+        "tools": None,
+        "teacher_targets": [
+            (1, [{"role": "user", "content": "one"}]),
+            (
+                3,
+                [
+                    {"role": "user", "content": "one"},
+                    {"role": "assistant", "content": "captured answer"},
+                    {"role": "user", "content": "two"},
+                ],
+            ),
+        ],
+        "provenance": {"group_id": "group", "split": "validation"},
+    }
+    responses = [
+        _response(prompt_token_ids=[1], token_ids=[2], content="new one"),
+        _response(prompt_token_ids=[3, 4], token_ids=[5], content="new two"),
+    ]
+    post, sent = _fake_post(responses)
+
+    async def render(prefix, _tools):
+        return list(range(len(prefix)))
+
+    samples: list[dict[str, Any]] = []
+    truncated = asyncio.run(
+        regenerate_teacher_targets(
+            post,
+            render,
+            item,
+            model="m",
+            max_tokens=4,
+            max_sequence_length=16,
+            endpoint="ep",
+            sampling_params={},
+            samples=samples,
+            detokenize=_detok,
+        )
+    )
+
+    assert not truncated
+    assert sent[1]["messages"][1]["content"] == "captured answer"
+    assert samples[1]["id"] == "conversation_turn3"
+    assert samples[1]["split"] == "validation"
+    assert samples[1]["group_id"] == "group"
 
 
 # --- ingestion: tools + tool results carried out of the raw row ---

@@ -260,7 +260,8 @@ class GenerationArgs(_Group):
 
     vllm_endpoint: str = Field(
         default="http://localhost:8000/v1",
-        description="vLLM endpoint used to generate hidden states on demand. Only "
+        description="Comma-separated vLLM endpoints used to generate hidden states "
+        "on demand. Samples are assigned deterministically across endpoints. Only "
         "needed if --on-missing=generate and samples are missing. The vLLM instance "
         "must cache hidden states to a location reachable from the training instance.",
     )
@@ -396,6 +397,12 @@ class TrainerArgs(_Group):
         default=1.0,
         description="Save a checkpoint every N epochs. Values < 1 enable sub-epoch "
         "checkpointing (e.g. 0.5 = every half epoch).",
+    )
+    checkpoint_steps: int | None = Field(
+        default=None,
+        ge=1,
+        description="Additionally save a resumable checkpoint every N optimizer "
+        "steps. Useful for long single-epoch runs.",
     )
     save_best: bool = Field(
         default=False,

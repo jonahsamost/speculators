@@ -211,6 +211,7 @@ class TestTrainCommand:
         assert "--verifier-name-or-path" in output
         assert "--config" in output
         assert "--speculator-type" in output
+        assert "--checkpoint-steps" in output
 
     def test_train_appears_in_pipeline_panel(self):
         result = runner.invoke(app, ["--help"])

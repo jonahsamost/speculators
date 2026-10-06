@@ -2,6 +2,7 @@
 
 import math
 
+import pytest
 import torch
 from torch import nn
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
@@ -66,6 +67,40 @@ def test_mtp_confidence_head_trains_with_step_embeddings(seed):
     assert model.confidence_step_embeddings.weight.grad is not None
     assert "confidence_loss_sum" in metrics
     assert "confidence_cumprod_bias_sum" in metrics
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_mtp_confidence_head_fused_gpu_forward_backward(seed):
+    """Exercise the fused acceptance target used by real GPU training."""
+    model = _tiny_confidence_model().to(device="cuda", dtype=torch.bfloat16)
+    input_ids = torch.randint(0, model.config.vocab_size, (1, 8), device="cuda")
+    hidden_states = torch.randn(
+        1,
+        8,
+        model.config.hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+
+    _, loss, metrics = model(
+        input_ids=input_ids,
+        hidden_states=hidden_states,
+        loss_mask=torch.ones_like(input_ids),
+    )
+    assert torch.isfinite(loss)
+    loss.backward()
+
+    assert model.confidence_head is not None
+    assert model.confidence_step_embeddings is not None
+    confidence_parameters = {
+        "confidence_head": model.confidence_head.proj.weight,
+        "step_embeddings": model.confidence_step_embeddings.weight,
+    }
+    for name, parameter in confidence_parameters.items():
+        assert parameter.grad is not None, f"missing gradient for {name}"
+        assert torch.isfinite(parameter.grad).all(), f"non-finite gradient for {name}"
+        assert torch.count_nonzero(parameter.grad), f"zero gradient for {name}"
+    assert "confidence_loss_sum" in metrics
 
 
 def test_qwen35_position_ids_are_expanded_for_new_transformers():

@@ -170,29 +170,56 @@ class ArrowDataset(BaseDataset):
         max_consecutive_generation_failures: int = 20,
     ):
         self.data = load_from_disk(datapath)
-        if not 0.0 < train_ratio <= 1.0:
-            raise ValueError(f"train_ratio must be in (0.0, 1.0], got {train_ratio}")
-        if split == "val" and train_ratio == 1.0:
-            raise ValueError("train_ratio=1.0 leaves no validation split")
+        self.uses_explicit_splits = "split" in self.data.column_names
+        if self.uses_explicit_splits:
+            requested = "validation" if split == "val" else "train"
+            indices = [
+                index
+                for index, value in enumerate(self.data.with_format(None)["split"])
+                if value == requested
+            ]
+            if not indices:
+                raise ValueError(
+                    f"prepared dataset has no rows for split={requested!r}"
+                )
+            self.file_indices = indices
+            self.start_file_idx = indices[0]
+            self.data = self.data.select(indices).remove_columns("split")
+        else:
+            if not 0.0 < train_ratio <= 1.0:
+                raise ValueError(
+                    f"train_ratio must be in (0.0, 1.0], got {train_ratio}"
+                )
+            if split == "val" and train_ratio == 1.0:
+                raise ValueError("train_ratio=1.0 leaves no validation split")
 
-        # Both splits derive their boundary from this one expression,
-        # so they are exactly complementary.
-        split_idx = int(len(self.data) * train_ratio)
-        start, stop = (
-            (0, split_idx) if split == "train" else (split_idx, len(self.data))
-        )
-        if start >= stop:
-            raise ValueError(
-                f"{split} split is empty (dataset has {len(self.data)} rows, "
-                f"train_ratio={train_ratio} gives split_idx={split_idx})"
+            # Both splits derive their boundary from this one expression,
+            # so they are exactly complementary.
+            split_idx = int(len(self.data) * train_ratio)
+            start, stop = (
+                (0, split_idx) if split == "train" else (split_idx, len(self.data))
             )
-        self.start_file_idx = start
-        self.data = self.data.select(range(start, stop))
+            if start >= stop:
+                raise ValueError(
+                    f"{split} split is empty (dataset has {len(self.data)} rows, "
+                    f"train_ratio={train_ratio} gives split_idx={split_idx})"
+                )
+            self.file_indices = list(range(start, stop))
+            self.start_file_idx = start
+            self.data = self.data.select(range(start, stop))
 
         self.transfer = transfer or FileTransfer(Path(datapath) / "hidden_states")
-        self.vllm_endpoint = vllm_endpoint
+        self.vllm_endpoints = tuple(
+            endpoint.strip()
+            for endpoint in vllm_endpoint.split(",")
+            if endpoint.strip()
+        )
+        if not self.vllm_endpoints:
+            raise ValueError("vllm_endpoint must contain at least one endpoint")
         self.on_missing = on_missing
+        self.clients: dict[str, openai.OpenAI] = {}
         self.client: openai.OpenAI | None = None
+        self.transfer_is_setup = False
         self.model = model
         self.request_timeout = request_timeout
         self.max_retries = max_retries
@@ -205,12 +232,12 @@ class ArrowDataset(BaseDataset):
         super().__init__(max_len, transform, hidden_states_dtype)
 
     def _map_to_file_idx(self, index: int):
+        if self.uses_explicit_splits:
+            return self.file_indices[index]
         return index + self.start_file_idx
 
-    def _setup_client(self):
-        client = openai.OpenAI(
-            base_url=self.vllm_endpoint, api_key="EMPTY", max_retries=0
-        )
+    def _setup_client(self, endpoint: str) -> openai.OpenAI:
+        client = openai.OpenAI(base_url=endpoint, api_key="EMPTY", max_retries=0)
         list_models = client.models.list()
         model_id = list_models.data[0].id
         if self.model and self.model != model_id:
@@ -220,10 +247,15 @@ class ArrowDataset(BaseDataset):
                 "Please make sure --endpoint is set to the correct vllm instance."
             )
         self.model = model_id
-        self.transfer.setup()
+        if not self.transfer_is_setup:
+            self.transfer.setup()
+            self.transfer_is_setup = True
         # Do not retain a half-initialized client if model discovery or Mooncake
         # setup failed; the outer full-round-trip retry should redo initialization.
-        self.client = client
+        self.clients[endpoint] = client
+        if len(self.vllm_endpoints) == 1:
+            self.client = client
+        return client
 
     def __len__(self):
         return len(self.data)
@@ -236,13 +268,17 @@ class ArrowDataset(BaseDataset):
         self,
         dataset_item: dict,
         client_item: ClientItem,
+        endpoint: str,
     ) -> dict[str, torch.Tensor]:
         handle: str | None = None
         try:
-            if not self.client:
-                self._setup_client()
+            client = self.clients.get(endpoint)
+            if client is None and len(self.vllm_endpoints) == 1:
+                client = self.client
+            if client is None:
+                client = self._setup_client(endpoint)
             handle = generate_hidden_states(
-                self.client,  # type:ignore[arg-type]
+                client,
                 self.model,  # type:ignore[arg-type]
                 client_item,
                 timeout=self.request_timeout,
@@ -286,14 +322,16 @@ class ArrowDataset(BaseDataset):
             if self.on_missing == "generate":
                 dataset_item = self.data[index]
                 client_item = build_client_item(dataset_item)
+                endpoint = self.vllm_endpoints[file_idx % len(self.vllm_endpoints)]
                 loaded_hs = self.generation_recovery.run(
                     lambda: self._generate_hidden_states_once(
                         dataset_item,
                         client_item,
+                        endpoint,
                     ),
                     description=(
                         f"Hidden-state round trip failed for dataset index {index}, "
-                        f"file index {file_idx}"
+                        f"file index {file_idx}, endpoint {endpoint}"
                     ),
                 )
             elif self.on_missing == "skip":

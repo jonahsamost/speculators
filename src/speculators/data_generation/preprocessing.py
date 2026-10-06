@@ -405,6 +405,8 @@ def _append_boundary_rows(
     rows: list[BoundaryRow],
     max_length: int,
     minimum_valid_tokens: int | None,
+    *,
+    split: str | None = None,
 ) -> tuple[int, int, int]:
     """Append rendered rows and return kept, unsupervised, and
     maybe-truncated counts.
@@ -429,6 +431,8 @@ def _append_boundary_rows(
         num_maybe_truncated += maybe_truncated and status == "kept"
         if status == "kept":
             num_kept += 1
+            if split is not None:
+                results["split"].append(split)
             if "messages" in results:
                 results["messages"].append(_adapt_conv_for_vllm(row["conv"]))
 
@@ -464,9 +468,14 @@ def _passthrough_pretokenized(
     these rows only need truncation and filtering.
     """
     results: dict[str, list] = {"input_ids": [], "loss_mask": [], "seq_len": []}
+    splits = examples.get("split")
+    if splits is not None:
+        results["split"] = []
     num_unsupervised = 0
     num_maybe_truncated = 0
-    for ids, mask in zip(examples["input_ids"], examples["loss_mask"], strict=True):
+    for index, (ids, mask) in enumerate(
+        zip(examples["input_ids"], examples["loss_mask"], strict=True)
+    ):
         # A per-row length skew survives strict= column pairing; the collator
         # packs each key independently and would shift the mask silently.
         if len(ids) != len(mask):
@@ -475,6 +484,8 @@ def _passthrough_pretokenized(
                 f"input_ids={len(ids)}, loss_mask={len(mask)}"
             )
         status = _append_row(results, ids, mask, max_length, minimum_valid_tokens)
+        if status == "kept" and splits is not None:
+            results["split"].append(splits[index])
         num_unsupervised += status == "unsupervised"
         # Kept-but-truncated only: a row clipped past its boundary reports as
         # unsupervised above, and would otherwise be counted twice.
@@ -505,6 +516,11 @@ def _preprocess_batch(
 
     results: dict[str, list] = {"input_ids": [], "loss_mask": [], "seq_len": []}
     conversations: list[list[dict]] = examples.get("conversations", [])
+    splits = examples.get("split")
+    if splits is not None:
+        if len(splits) != len(conversations):
+            raise ValueError("split column length must match conversations")
+        results["split"] = []
 
     # MM inputs are extracted via the Chat Completions API, which needs the
     # original messages -- token ids alone cannot carry the images.
@@ -546,6 +562,7 @@ def _preprocess_batch(
             rows,
             max_length,
             minimum_valid_tokens,
+            split=splits[idx] if splits is not None else None,
         )
         num_unsupervised += row_unsupervised
         num_maybe_truncated += row_maybe_truncated

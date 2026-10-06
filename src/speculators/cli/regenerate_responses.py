@@ -9,9 +9,9 @@ import re
 import sys
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Literal, cast
 
 import aiohttp
 import typer
@@ -97,6 +97,104 @@ def extract_conversation(
     if isinstance(prompt, str) and prompt:
         return [{"role": "user", "content": prompt}], []
     return [], []
+
+
+def extract_teacher_targets(
+    row: dict[str, Any], prompt_field: str | None
+) -> list[tuple[int, list[dict[str, Any]]]]:
+    """Return one original-history prompt for every assistant boundary.
+
+    Unlike rollout regeneration, each prompt retains the captured assistant and
+    tool messages before the target. This keeps later user turns coherent and
+    prevents generation drift from compounding across a conversation.
+    """
+
+    messages: list[dict[str, Any]] = []
+    targets: list[tuple[int, list[dict[str, Any]]]] = []
+    raw_messages = _conversation_messages(row)
+    for index, raw in enumerate(raw_messages):
+        if not isinstance(raw, dict):
+            continue
+        raw_role = raw.get("role") or raw.get("from")
+        if not isinstance(raw_role, str):
+            continue
+        role = {
+            "human": "user",
+            "gpt": "assistant",
+        }.get(raw_role, raw_role)
+        if role not in {"system", "user", "assistant", "tool"}:
+            continue
+        message = dict(raw)
+        message.pop("from", None)
+        message.pop("value", None)
+        message["role"] = role
+        if "content" not in message:
+            message["content"] = raw.get("value")
+
+        if role == "assistant" and any(m["role"] == "user" for m in messages):
+            targets.append((index, [dict(m) for m in messages]))
+        messages.append(message)
+
+    # Captures commonly end at the request boundary and therefore contain no
+    # assistant response yet. Generate that final target as well.
+    if messages and messages[-1]["role"] in {"user", "tool"}:
+        targets.append((len(raw_messages), [dict(m) for m in messages]))
+
+    if targets:
+        return targets
+
+    prompt = row.get(prompt_field) if prompt_field else None
+    if isinstance(prompt, str) and prompt:
+        return [(0, [{"role": "user", "content": prompt}])]
+    return []
+
+
+def _drop_oldest_history_group(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]] | None:
+    """Drop the oldest complete pre-current-user group, preserving system turns."""
+
+    first_non_system = next(
+        (
+            index
+            for index, message in enumerate(messages)
+            if message["role"] != "system"
+        ),
+        len(messages),
+    )
+    user_indices = [
+        index
+        for index, message in enumerate(messages)
+        if index >= first_non_system and message["role"] == "user"
+    ]
+    if user_indices[1:]:
+        start, stop = user_indices[0], user_indices[1]
+    elif user_indices and first_non_system < user_indices[0]:
+        start, stop = first_non_system, user_indices[0]
+    else:
+        return None
+    return [*messages[:start], *messages[stop:]]
+
+
+async def trim_teacher_prefix(
+    render_fn: Callable[[list[dict[str, Any]], list | None], Awaitable[list[int]]],
+    messages: list[dict[str, Any]],
+    tools: list | None,
+    max_prompt_tokens: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Trim at turn boundaries until the exact vLLM render fits the prompt budget."""
+
+    trimmed = [dict(message) for message in messages]
+    dropped = 0
+    while len(await render_fn(trimmed, tools)) > max_prompt_tokens:
+        shorter = _drop_oldest_history_group(trimmed)
+        if shorter is None:
+            raise ValueError(
+                "system, tools, current user/tool context exceeds max prompt tokens"
+            )
+        dropped += len(trimmed) - len(shorter)
+        trimmed = shorter
+    return trimmed, dropped
 
 
 def prepare_row(
@@ -311,6 +409,42 @@ async def _post_chat(
         return await response.json()
 
 
+async def _render_chat(
+    session: aiohttp.ClientSession,
+    endpoint: str,
+    messages: list[dict[str, Any]],
+    tools: list | None,
+    truncate_prompt_tokens: int | None = None,
+) -> list[int]:
+    """Render through the same vLLM replica used for generation.
+
+    Capping the render at the model sequence length lets vLLM return a token
+    count even when the untrimmed captured history is longer than its context
+    window.  Teacher-mode trimming can then remove whole old turns until the
+    prompt fits the smaller prompt budget reserved beside the completion.
+    """
+
+    render_endpoint = f"{endpoint.rstrip('/')}/render"
+    payload: dict[str, Any] = {
+        "messages": messages,
+        "add_generation_prompt": True,
+    }
+    if truncate_prompt_tokens is not None:
+        payload["truncate_prompt_tokens"] = truncate_prompt_tokens
+        payload["truncation_side"] = "left"
+    if tools:
+        payload["tools"] = tools
+    async with session.post(render_endpoint, json=payload) as response:
+        if not response.ok:
+            body = (await response.text())[:500]
+            raise RuntimeError(f"HTTP {response.status} from {render_endpoint}: {body}")
+        data = await response.json()
+    token_ids = data.get("token_ids")
+    if not isinstance(token_ids, list):
+        raise ValueError(f"render response missing token_ids: {data}")
+    return token_ids
+
+
 # ---------------------------------------------------------------------------
 # Regeneration: model response -> boundary training samples
 # ---------------------------------------------------------------------------
@@ -348,6 +482,8 @@ def _sample_from_response(
     idx: int,
     endpoint: str,
     sampling_params: dict[str, Any],
+    sample_suffix: str | None = None,
+    provenance: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], list | None]:
     """Turn one chat-completion response into a boundary sample and the assistant
     message to append to the running prefix.
@@ -386,7 +522,7 @@ def _sample_from_response(
         assistant_msg = {"role": "assistant", "content": content}
 
     sample = {
-        "id": f"{conv_id}_gen{sample_index}",
+        "id": f"{conv_id}_{sample_suffix or f'gen{sample_index}'}",
         # Conversation-level key for --resume; the row `id` is generation-suffixed
         # and would never match a recomputed one.
         "primary_id": conv_id,
@@ -405,7 +541,79 @@ def _sample_from_response(
             "sampling_params": sampling_params,
         },
     }
+    if provenance:
+        for key in ("group_id", "split", "source"):
+            if key in provenance:
+                sample[key] = provenance[key]
     return sample, assistant_msg, tool_calls
+
+
+async def regenerate_teacher_targets(
+    post_fn,
+    render_fn,
+    item: dict[str, Any],
+    *,
+    model: str,
+    max_tokens: int,
+    max_sequence_length: int,
+    endpoint: str,
+    sampling_params: dict[str, Any],
+    samples: list[dict[str, Any]],
+    detokenize: Callable[[list[int]], str],
+    reasoning_effort: str | None = None,
+    temperature: float | None = None,
+) -> bool:
+    """Regenerate each assistant target against its captured original history."""
+
+    tools = item.get("tools")
+    conv_id = item["primary_id"]
+    max_prompt_tokens = max_sequence_length - max_tokens
+    any_truncated = False
+    for target_index, original_prefix in item["teacher_targets"]:
+        prefix, dropped_messages = await trim_teacher_prefix(
+            render_fn,
+            original_prefix,
+            tools,
+            max_prompt_tokens,
+        )
+        overrides = {
+            key: value
+            for key, value in (
+                ("reasoning_effort", reasoning_effort),
+                ("temperature", temperature),
+            )
+            if value is not None
+        }
+        recorded_params = {**sampling_params, **overrides}
+        payload: dict[str, Any] = {
+            **recorded_params,
+            "model": model,
+            "messages": prefix,
+            "max_tokens": max_tokens,
+            "return_token_ids": True,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        data = await post_fn(payload)
+        sample, _assistant_msg, _tool_calls = _sample_from_response(
+            data,
+            detokenize=detokenize,
+            conv_id=conv_id,
+            sample_index=len(samples),
+            sample_suffix=f"turn{target_index}",
+            idx=item["idx"],
+            endpoint=endpoint,
+            sampling_params=recorded_params,
+            provenance=item.get("provenance"),
+        )
+        sample["metadata"]["target_turn"] = target_index
+        sample["metadata"]["history_mode"] = "teacher"
+        sample["metadata"]["dropped_messages"] = dropped_messages
+        samples.append(sample)
+        any_truncated |= data["choices"][0].get("finish_reason") == "length"
+    return any_truncated
 
 
 async def regenerate_conversation(
@@ -564,7 +772,7 @@ def ensure_parent_dirs(*paths: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _worker(
+async def _worker(  # noqa: C901
     session: aiohttp.ClientSession,
     queue: "asyncio.Queue[dict[str, Any]]",
     *,
@@ -578,6 +786,8 @@ async def _worker(
     progress,
     stats: dict[str, Any],
     detokenize: Callable[[list[int]], str],
+    max_sequence_length: int | None = None,
+    history_mode: str = "rollout",
 ):
     """Pull conversations off the queue and regenerate them into boundary rows.
 
@@ -595,6 +805,15 @@ async def _worker(
         logger.debug("vLLM request completed in %.0f ms", latency * 1000)
         return result
 
+    async def render(messages: list[dict[str, Any]], tools: list | None) -> list[int]:
+        return await _render_chat(
+            session,
+            endpoint,
+            messages,
+            tools,
+            truncate_prompt_tokens=max_sequence_length,
+        )
+
     while True:
         item = await queue.get()
         if item is None:
@@ -606,18 +825,38 @@ async def _worker(
         # many rows had been completed.
         samples: list[dict[str, Any]] = []
         try:
-            truncated = await regenerate_conversation(
-                post,
-                item,
-                model=model,
-                max_tokens=max_tokens,
-                endpoint=endpoint,
-                sampling_params=sampling_params,
-                samples=samples,
-                detokenize=detokenize,
-                reasoning_effort=item.get("reasoning_effort"),
-                temperature=item.get("temperature"),
-            )
+            if history_mode == "teacher":
+                if max_sequence_length is None:
+                    raise ValueError(
+                        "max_sequence_length is required for teacher history mode"
+                    )
+                truncated = await regenerate_teacher_targets(
+                    post,
+                    render,
+                    item,
+                    model=model,
+                    max_tokens=max_tokens,
+                    max_sequence_length=max_sequence_length,
+                    endpoint=endpoint,
+                    sampling_params=sampling_params,
+                    samples=samples,
+                    detokenize=detokenize,
+                    reasoning_effort=item.get("reasoning_effort"),
+                    temperature=item.get("temperature"),
+                )
+            else:
+                truncated = await regenerate_conversation(
+                    post,
+                    item,
+                    model=model,
+                    max_tokens=max_tokens,
+                    endpoint=endpoint,
+                    sampling_params=sampling_params,
+                    samples=samples,
+                    detokenize=detokenize,
+                    reasoning_effort=item.get("reasoning_effort"),
+                    temperature=item.get("temperature"),
+                )
             # Written only after the conversation finishes -- a clean truncation
             # included, since rerunning it would truncate again. An exception
             # writes nothing, so any row in the output file means the
@@ -697,6 +936,8 @@ async def _run(  # noqa: C901
     limit: int | None,
     concurrency: int,
     max_tokens: int,
+    max_sequence_length: int | None,
+    history_mode: str,
     sampling_params: dict[str, Any],
     outfile: str | None,
     resume: bool,
@@ -707,11 +948,14 @@ async def _run(  # noqa: C901
     seed: int | None,
 ) -> None:
     """Main async function to process dataset through vLLM endpoints."""
-    typer.echo(f"Using endpoint: {endpoint}")
+    endpoints = tuple(value.strip() for value in endpoint.split(",") if value.strip())
+    if not endpoints:
+        raise ValueError("at least one endpoint is required")
+    typer.echo(f"Using endpoints: {', '.join(endpoints)}")
 
     # Auto-detect model if not specified
     if model is None:
-        model = await detect_model(endpoint)
+        model = await detect_model(endpoints[0])
 
     typer.echo(f"Using model: {model}")
     if reasoning_effort_dist:
@@ -791,7 +1035,9 @@ async def _run(  # noqa: C901
                         queue,
                         model=model,
                         max_tokens=max_tokens,
-                        endpoint=endpoint,
+                        max_sequence_length=max_sequence_length,
+                        history_mode=history_mode,
+                        endpoint=endpoints[worker_index % len(endpoints)],
                         sampling_params=sampling_params,
                         max_retries=max_retries,
                         out_fh=output_file,
@@ -801,7 +1047,7 @@ async def _run(  # noqa: C901
                         detokenize=detokenize,
                     )
                 )
-                for _ in range(concurrency)
+                for worker_index in range(concurrency)
             ]
 
             rng = random.Random(seed)
@@ -817,6 +1063,11 @@ async def _run(  # noqa: C901
                 if prepared is None:
                     continue
                 normalized, turns, tool_results = prepared
+                teacher_targets = extract_teacher_targets(
+                    normalized, dataset_config.prompt_field
+                )
+                if history_mode == "teacher" and not teacher_targets:
+                    continue
 
                 primary_id = _primary_identifier(row)
                 if primary_id in seen_ids:
@@ -837,7 +1088,7 @@ async def _run(  # noqa: C901
                             "idx": index,
                             "error": repr(exc),
                             "generations_completed": 0,
-                            "endpoint": endpoint,
+                            "endpoints": endpoints,
                         },
                     }
                     error_file.write(
@@ -854,6 +1105,12 @@ async def _run(  # noqa: C901
                     "turns": turns,
                     "tools": tools,
                     "tool_results": tool_results,
+                    "teacher_targets": teacher_targets,
+                    "provenance": {
+                        key: normalized[key]
+                        for key in ("group_id", "split", "source")
+                        if key in normalized
+                    },
                 }
                 if reasoning_effort_dist is not None:
                     vals = list(reasoning_effort_dist)
@@ -898,7 +1155,7 @@ def _validate_dataset(value: str) -> str:
     return str(dataset_path)
 
 
-def regenerate_responses(
+def regenerate_responses(  # noqa: C901
     endpoint: Annotated[
         str,
         typer.Option(
@@ -949,6 +1206,21 @@ def regenerate_responses(
         int,
         typer.Option(help="max_tokens for generation"),
     ] = 8192,
+    max_sequence_length: Annotated[
+        int | None,
+        typer.Option(
+            help="Total prompt + completion budget. Required for teacher history mode."
+        ),
+    ] = None,
+    history_mode: Annotated[
+        Literal["rollout", "teacher"],
+        typer.Option(
+            help=(
+                "Use generated history (rollout) or captured history per target "
+                "(teacher)."
+            )
+        ),
+    ] = "rollout",
     sampling_params: Annotated[
         str | None,
         typer.Option(
@@ -1025,6 +1297,14 @@ def regenerate_responses(
 
     if max_retries < 0:
         raise typer.BadParameter("--max-retries must be >= 0")
+    if max_tokens <= 0:
+        raise typer.BadParameter("--max-tokens must be > 0")
+    if history_mode == "teacher" and max_sequence_length is None:
+        raise typer.BadParameter(
+            "--max-sequence-length is required with --history-mode teacher"
+        )
+    if max_sequence_length is not None and max_tokens >= max_sequence_length:
+        raise typer.BadParameter("--max-tokens must be below --max-sequence-length")
 
     parsed_sampling_params: dict[str, Any] = {}
     if sampling_params is not None:
@@ -1060,6 +1340,8 @@ def regenerate_responses(
                 limit=limit,
                 concurrency=concurrency,
                 max_tokens=max_tokens,
+                max_sequence_length=max_sequence_length,
+                history_mode=history_mode,
                 sampling_params=parsed_sampling_params,
                 outfile=outfile,
                 resume=resume,

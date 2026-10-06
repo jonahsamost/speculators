@@ -568,7 +568,12 @@ def test_dflash2_confidence_loss_reaches_confidence_logits():
 def test_tiny_gpu_forward_backward_reaches_all_new_parameters():
     """A real training step must update every convolution and selector tensor."""
     torch.manual_seed(0)
-    model = DFlash2DraftModel(_tiny_config()).to(  # type: ignore[call-arg]
+    model = DFlash2DraftModel(
+        _tiny_config(
+            enable_confidence_head=True,
+            confidence_head_with_selector_context=True,
+        )
+    ).to(  # type: ignore[call-arg]
         device="cuda",
         dtype=torch.bfloat16,
     )
@@ -619,6 +624,7 @@ def test_tiny_gpu_forward_backward_reaches_all_new_parameters():
         "attention_conv",
         "mlp_conv",
         "candidate_selector",
+        "confidence_head",
     )
     new_parameters = {
         name: parameter

@@ -90,3 +90,25 @@ def test_small_dataset_both_splits_nonempty(tmp_path):
     val = _split(path, 0.5, "val")
     assert len(train) == 1
     assert len(val) == 1
+
+
+def test_explicit_split_column_overrides_row_ratio(tmp_path):
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[index] for index in range(6)],
+            "loss_mask": [[1]] * 6,
+            "seq_len": [1] * 6,
+            "split": ["train", "validation", "train", "test", "validation", "train"],
+        }
+    )
+    path = tmp_path / "explicit"
+    ds.save_to_disk(str(path))
+    (path / "hidden_states").mkdir()
+
+    train = _split(str(path), 0.5, "train")
+    val = _split(str(path), 0.5, "val")
+
+    assert train.file_indices == [0, 2, 5]
+    assert val.file_indices == [1, 4]
+    assert {ids[0] for ids in train.data["input_ids"]} == {0, 2, 5}
+    assert {ids[0] for ids in val.data["input_ids"]} == {1, 4}
