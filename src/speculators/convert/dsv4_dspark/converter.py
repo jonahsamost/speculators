@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
 import torch
@@ -98,7 +97,7 @@ class DSV4DSparkConverter:
             ),
         )
 
-        logger.info("Dequantizing native DeepSeek V4.1 DSpark weights to BF16")
+        logger.info("Dequantizing native DeepSeek V4.1 DSpark weights for training")
         state = load_released_state_dict(local_path, config.backbone_config())
         model = DSV4DSparkDraftModel(config)
         missing, unexpected = model.load_state_dict(state, strict=False)
@@ -110,9 +109,6 @@ class DSV4DSparkConverter:
             "lm_head.weight",
             "verifier_lm_head.weight",
             "verifier_norm.weight",
-            "hc_head.hc_fn",
-            "hc_head.hc_base",
-            "hc_head.hc_scale",
         }
         critical = sorted(set(missing) - allowed_missing)
         if critical:
@@ -120,19 +116,8 @@ class DSV4DSparkConverter:
                 f"native DSpark conversion left trainable weights missing: {critical}"
             )
 
-        # V4.1 does not serialize a separate final mHC collapse. Start it as a
-        # neutral mean over the four residual streams; it remains trainable.
-        with torch.no_grad():
-            model.hc_head.hc_fn.zero_()
-            target = 1.0 / config.hc_mult - config.hc_eps
-            model.hc_head.hc_base.fill_(math.log(target / (1.0 - target)))
-            model.hc_head.hc_scale.zero_()
-        logger.warning(
-            "The source checkpoint omits the final mHC collapse; initialized it "
-            "to a neutral stream mean. Validate converted-vs-native logits before "
-            "a production fine-tune."
-        )
-
+        # Training is deliberately uniform BF16. The vLLM export step restores
+        # the released checkpoint's per-tensor inference dtypes and quantization.
         model.to(dtype=torch.bfloat16)
         model.save_pretrained(str(output_path))
         logger.success("Saved trainable native DSpark checkpoint to {}", output_path)

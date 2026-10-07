@@ -16,8 +16,9 @@ them internally (``_remap_dspark_name``: ``.attn.``->``.self_attn.``, ``.ffn.``-
 So this conversion is exactly the INVERSE of
 ``speculators/src/speculators/models/dsv4_dspark/weights.py::map_released_key``
 (released ``mtp.*`` -> ours ``layers.*``), PLUS unstacking the ``GroupedExperts``
-weights back to per-expert tensors. Nothing is quantized — the draft is bf16, so the
-released fp8/fp4 ``.scale`` sidecars do not apply.
+weights back to per-expert tensors. This script emits a bf16 interchange checkpoint;
+use the serving-export script to restore the released fp8/fp4 representation required
+by the DeepSeek V4.1 vLLM runtime.
 
 Key map (ours -> released ``mtp.*``):
 
@@ -28,7 +29,6 @@ Key map (ours -> released ``mtp.*``):
   norm.weight                         -> mtp.{last}.norm.weight
   markov_head.*                       -> mtp.{last}.markov_head.*
   confidence_head.proj.weight         -> mtp.{last}.confidence_head.proj.weight
-  hc_head.hc_{fn,base,scale}          -> mtp.{last}.hc_head_{fn,base,scale}
   layers.{n}.attn.*                   -> mtp.{n}.attn.*            (incl attn_sink)
   layers.{n}.attn_norm.weight         -> mtp.{n}.attn_norm.weight
   layers.{n}.ffn_norm.weight          -> mtp.{n}.ffn_norm.weight
@@ -99,9 +99,10 @@ def _map(key: str, last: int):
         return [f"mtp.{last}.markov_head.head.weight"]
     if key == "confidence_head.proj.weight":
         return [f"mtp.{last}.confidence_head.proj.weight"]
-    m = re.fullmatch(r"hc_head\.hc_(fn|base|scale)", key)
-    if m:
-        return [f"mtp.{last}.hc_head_{m.group(1)}"]
+    # Compatibility with checkpoints produced before the V4.1 mHC correction.
+    # vLLM collapses with the last FFN's pre-mix and has no terminal HC module.
+    if re.fullmatch(r"hc_head\.hc_(fn|base|scale)", key):
+        return None
 
     lm = re.fullmatch(r"layers\.(\d+)\.(.*)", key)
     if not lm:
@@ -206,14 +207,23 @@ def main() -> None:
     src_cfg = Path(args.config_from) if args.config_from else (in_dir / "config.json")
     if src_cfg.exists():
         cfg = json.loads(src_cfg.read_text())
+        # Multimodal/wrapper checkpoints such as DeepSeek-V4.1 keep the actual
+        # language-model configuration under ``text_config``. Preserve the
+        # wrapper for AutoConfig, but validate and patch the nested payload that
+        # vLLM ultimately passes to the DSpark model.
+        model_cfg = cfg.get("text_config", cfg)
+        if not isinstance(model_cfg, dict):
+            raise SystemExit(
+                f"!! config from {src_cfg} has a non-object text_config"
+            )
         # ★ serve reads the aux target layers from `eagle_aux_hidden_state_layer_ids` (EAGLE3 path in
         # model_runner). The released draft config leaves it None → the serve falls back to
         # get_eagle3_default_aux_hidden_state_layers() = 4 layers → target emits 4*H while our draft's
         # main_proj wants 3*H (dspark_target_layer_ids) → dim mismatch at the first draft proposal.
         # Pin it to dspark_target_layer_ids so the target captures exactly the layers the draft trained on.
-        tids = cfg.get("dspark_target_layer_ids")
-        if tids and not cfg.get("eagle_aux_hidden_state_layer_ids"):
-            cfg["eagle_aux_hidden_state_layer_ids"] = tids
+        tids = model_cfg.get("dspark_target_layer_ids")
+        if tids and not model_cfg.get("eagle_aux_hidden_state_layer_ids"):
+            model_cfg["eagle_aux_hidden_state_layer_ids"] = tids
             print(f">>> patched config.json: eagle_aux_hidden_state_layer_ids = {tids} (from dspark_target_layer_ids)")
         # ★ GUARD the serve-critical fields. The vLLM-Ascend DSpark serve reads these dspark_*/
         # sliding_window names; if any is ABSENT it silently falls back to a WRONG default and caps
@@ -226,7 +236,7 @@ def main() -> None:
         # Our OWN (plain-name) config lacks these, so this fires loudly if you forget --config-from.
         _required = ["dspark_noise_token_id", "dspark_target_layer_ids", "dspark_block_size",
                      "dspark_markov_rank", "sliding_window", "eagle_aux_hidden_state_layer_ids"]
-        _missing = [k for k in _required if cfg.get(k) in (None, "", [])]
+        _missing = [k for k in _required if model_cfg.get(k) in (None, "", [])]
         if _missing:
             raise SystemExit(
                 f"!! config from {src_cfg} is MISSING serve-critical field(s): {_missing}\n"
@@ -237,7 +247,7 @@ def main() -> None:
         (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
         print(f">>> wrote config.json (from {src_cfg})")
         print("    serve-critical fields: "
-              + "  ".join(f"{k}={cfg.get(k)}" for k in
+              + "  ".join(f"{k}={model_cfg.get(k)}" for k in
                           ("dspark_noise_token_id", "dspark_block_size", "dspark_target_layer_ids",
                            "sliding_window", "dspark_markov_rank")))
     else:

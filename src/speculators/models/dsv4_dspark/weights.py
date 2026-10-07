@@ -20,8 +20,7 @@ This module provides:
 Naming already lines up (we adopted the official ``wq_a`` / ``attn_sink`` /
 ``experts.i.w{1,2,3}`` names); the only renames are ``ffn.gate`` -> ``ffn.router``,
 ``hc_attn_*`` -> ``attn_hc.*``, ``hc_ffn_*`` -> ``ffn_hc.*``, and the stage-0/2
-extras (``main_proj`` / ``norm`` / ``markov_head`` / ``confidence_head`` /
-``hc_head_*``) which live at model level for us.
+extras (``main_proj`` / ``norm`` / ``markov_head`` / ``confidence_head``).
 """
 
 from __future__ import annotations
@@ -37,7 +36,7 @@ from .config import DSparkDraftConfig
 
 # Which mtp stage owns the "extra" (non-per-layer) parts.
 _STAGE0 = 0  # main_proj / main_norm
-# stage last (n_draft_layers - 1) owns: norm, markov_head, confidence_head, hc_head_*
+# stage last (n_draft_layers - 1) owns: norm, markov_head, confidence_head
 
 _HC_SITE = {"hc_attn": "attn_hc", "hc_ffn": "ffn_hc"}
 
@@ -47,7 +46,7 @@ def map_released_key(key: str, n_draft_layers: int = 3) -> str | None:
 
     ``None`` is returned for: ``.scale`` sidecars (folded into dequant), base
     ``layers.*`` decoder layers (target-only), and the base model's own
-    ``norm`` / ``hc_head_*`` (our draft's come from the last mtp stage).
+    ``norm`` / ``hc_head_*``. V4.1 has no standalone terminal HC head.
     """
     if key.endswith(".scale"):
         return None
@@ -84,7 +83,7 @@ def map_released_key(key: str, n_draft_layers: int = 3) -> str | None:
         return "confidence_head.proj.weight"
     hh = re.match(r"^hc_head_(fn|base|scale)$", rest)
     if hh:
-        return f"hc_head.hc_{hh.group(1)}"
+        return None
 
     # ---- per-layer block parts ----
     hc = re.match(r"^hc_(attn|ffn)_(fn|base|scale)$", rest)
@@ -255,6 +254,89 @@ def verify_mapping(released_keys, cfg: DSparkDraftConfig) -> dict:
 def _e8m0_scales(scale: torch.Tensor) -> torch.Tensor:
     """Decode exact powers-of-two stored as float8-e8m0 bytes."""
     return (scale.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
+
+
+def _encode_e8m0_scales(
+    minimum_scale: torch.Tensor, dtype: torch.dtype
+) -> torch.Tensor:
+    """Encode power-of-two scales which are at least ``minimum_scale``.
+
+    Rounding upward prevents a finite source value from overflowing the FP8 or
+    MXFP4 payload. E8M0 is stored as the IEEE-754 exponent byte, so the encoded
+    value is simply ``exponent + 127``.
+    """
+    safe = torch.where(
+        minimum_scale > 0, minimum_scale.float(), torch.ones_like(minimum_scale.float())
+    )
+    # Byte 0 decodes to IEEE zero in the serving kernels, so the smallest
+    # non-zero scale is exponent byte 1 (2**-126). Byte 255 is reserved.
+    exponent = torch.ceil(torch.log2(safe)).to(torch.int32).clamp(-126, 127)
+    encoded = (exponent + 127).to(torch.uint8)
+    return encoded.view(dtype)
+
+
+def quantize_released_weight(
+    weight: torch.Tensor,
+    template_weight: torch.Tensor,
+    template_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize BF16/FP32 weights into a released V4.1 tensor layout.
+
+    The released tensors are deliberately used as the schema: their dtype and
+    scale geometry decide whether this is 32x32 FP8 or row-wise 32-value
+    packed MXFP4. This makes export fail loudly if a future release changes its
+    representation instead of silently producing a checkpoint vLLM misreads.
+    """
+    source = weight.float()
+    if template_weight.dtype == torch.float8_e4m3fn:
+        if source.ndim != 2 or template_scale.ndim != 2:
+            raise ValueError("FP8 DSpark weights and scales must be 2-D")
+        rows, cols = source.shape
+        scale_rows, scale_cols = template_scale.shape
+        if rows % scale_rows or cols % scale_cols:
+            raise ValueError(
+                f"cannot infer exact FP8 tiles for weight {tuple(source.shape)} "
+                f"and scale {tuple(template_scale.shape)}"
+            )
+        row_block, col_block = rows // scale_rows, cols // scale_cols
+        if (row_block, col_block) != (32, 32):
+            raise ValueError(
+                f"expected released FP8 32x32 tiles, got {row_block}x{col_block}"
+            )
+        blocks = source.view(scale_rows, row_block, scale_cols, col_block)
+        amax = blocks.abs().amax(dim=(1, 3))
+        scales = _encode_e8m0_scales(
+            amax / torch.finfo(template_weight.dtype).max, template_scale.dtype
+        )
+        expanded = (
+            _e8m0_scales(scales).repeat_interleave(32, 0).repeat_interleave(32, 1)
+        )
+        quantized = (source / expanded).to(template_weight.dtype)
+        return quantized, scales
+
+    if template_weight.dtype not in (torch.int8, torch.uint8):
+        raise TypeError(f"unsupported released DSpark dtype: {template_weight.dtype}")
+    if source.ndim != 2 or template_scale.ndim != 2:
+        raise ValueError("MXFP4 DSpark weights and scales must be 2-D")
+    rows, cols = source.shape
+    if cols % 32 or tuple(template_scale.shape) != (rows, cols // 32):
+        raise ValueError(
+            f"expected row-wise MXFP4 groups of 32 for weight {tuple(source.shape)}, "
+            f"got scale {tuple(template_scale.shape)}"
+        )
+    groups = source.view(rows, cols // 32, 32)
+    amax = groups.abs().amax(dim=-1)
+    scales = _encode_e8m0_scales(amax / 6.0, template_scale.dtype)
+    normalized = groups / _e8m0_scales(scales).unsqueeze(-1)
+    codebook = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        dtype=torch.float32,
+        device=normalized.device,
+    )
+    codes = (normalized.unsqueeze(-1) - codebook).abs().argmin(dim=-1).to(torch.uint8)
+    codes = codes.view(rows, cols)
+    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    return packed.view(template_weight.dtype), scales
 
 
 def dequantize_released_weight(

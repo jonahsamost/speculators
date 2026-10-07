@@ -9,8 +9,9 @@ sublayer site (attention / MoE) a :class:`HyperConnection`:
     doubly-stochastic stream-mixing matrix ``comb`` used by :func:`place` to
     fold the sublayer output back into the multi-stream residual.
 
-:class:`HyperHead` is the lighter final collapse (``hc_mult`` → 1) before the
-shared norm + lm_head.
+DeepSeek V4.1 reuses the pre-mix computed at the final block's FFN boundary to
+collapse the residual streams before the shared norm + lm_head.  It does not
+have a separate learned terminal hyper-connection head.
 
 The math follows the reference exactly: ``pre = σ(·)+ε``, ``post = 2·σ(·)``
 (no ε), ``comb = softmax(·)+ε`` then Sinkhorn-Knopp (one column normalization,
@@ -34,8 +35,8 @@ _HC_OP = "mhc_hyper_connection"
 @torch_kernel(_HC_OP)
 def _hyper_connection_torch(
     module: HyperConnection, streams: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Reference mHC forward. ``streams [B, S, hc, D]`` -> ``(post, comb, collapsed)``.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reference mHC forward, including the carried ``pre`` weights.
 
     ``post [B, S, hc]``, ``comb [B, S, hc, hc]`` (doubly-stochastic),
     ``collapsed [B, S, D]``. Reads parameters off ``module`` so a bridge can
@@ -61,7 +62,7 @@ def _hyper_connection_torch(
         comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
 
     collapsed = (pre.unsqueeze(-1) * streams).sum(dim=2).to(streams.dtype)
-    return post, comb, collapsed
+    return post, comb, collapsed, pre
 
 
 def place(
@@ -97,30 +98,43 @@ class HyperConnection(nn.Module):
         self.scale = nn.Parameter(torch.ones(3))  # index 0=pre, 1=post, 2=comb
 
     def forward(
-        self, streams: torch.Tensor, backend: str | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return get_kernel(_HC_OP, backend)(self, streams)
+        self,
+        streams: torch.Tensor,
+        backend: str | None = None,
+        *,
+        return_pre: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
+        result = get_kernel(_HC_OP, backend)(self, streams)
+        if len(result) == 4:
+            post, comb, collapsed, pre = result
+        else:
+            # Accelerator bridges written against the original three-tensor
+            # contract remain valid. Only the final FFN needs this fallback.
+            post, comb, collapsed = result
+            pre = self.pre_weights(streams) if return_pre else None
+        if return_pre:
+            assert pre is not None
+            return post, comb, collapsed, pre
+        return post, comb, collapsed
 
+    def pre_weights(self, streams: torch.Tensor) -> torch.Tensor:
+        """Return the collapse weights produced at this mHC boundary.
 
-class HyperHead(nn.Module):
-    """Final mHC collapse: ``[B, S, hc, D]`` -> ``[B, S, D]`` (pre weights only)."""
-
-    def __init__(self, cfg) -> None:
-        super().__init__()
-        self.hc_mult = cfg.hc_mult
-        self.hc_eps = cfg.hc_eps
-        self.input_norm = UnweightedRMSNorm(cfg.rms_norm_eps)
-        self.hc_fn = nn.Parameter(
-            torch.empty(self.hc_mult, self.hc_mult * cfg.hidden_size)
-        )
-        self.hc_base = nn.Parameter(torch.zeros(self.hc_mult))
-        self.hc_scale = nn.Parameter(torch.ones(1))
-
-    def forward(self, streams: torch.Tensor) -> torch.Tensor:
+        vLLM carries these weights from one sublayer boundary to the next and
+        reuses the final FFN boundary's weights for the V4.1 output collapse.
+        The training reference computes them explicitly so the same tensor is
+        available after the final FFN has been placed into the streams.
+        """
         flat = self.input_norm(streams.flatten(start_dim=2).float())
-        mixes = F.linear(flat, self.hc_fn.float())
-        pre = (
-            torch.sigmoid(mixes * self.hc_scale.float() + self.hc_base.float())
+        pre_logits = F.linear(flat, self.fn[: self.hc_mult].float())
+        return (
+            torch.sigmoid(
+                pre_logits * self.scale[0].float() + self.base[: self.hc_mult].float()
+            )
             + self.hc_eps
         )
-        return (pre.unsqueeze(-1) * streams).sum(dim=2).to(streams.dtype)
+
+
+def collapse_streams(streams: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
+    """Collapse V4.1 residual streams with a carried FFN pre-mix."""
+    return (pre.unsqueeze(-1) * streams).sum(dim=2).to(streams.dtype)

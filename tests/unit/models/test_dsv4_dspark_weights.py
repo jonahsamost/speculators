@@ -3,6 +3,7 @@ import torch
 from speculators.models.dsv4_dspark.weights import (
     dequantize_released_weight,
     map_released_key,
+    quantize_released_weight,
 )
 
 
@@ -19,6 +20,9 @@ def test_v41_native_key_mapping() -> None:
     )
     assert map_released_key("mtp.1.ffn.gate.weight") == "layers.1.ffn.router.weight"
     assert map_released_key("mtp.1.ffn.gate.bias_vl") is None
+    assert map_released_key("mtp.2.hc_head_fn") is None
+    assert map_released_key("mtp.2.hc_head_base") is None
+    assert map_released_key("mtp.2.hc_head_scale") is None
 
 
 def test_mxfp4_dequantizes_packed_nibbles() -> None:
@@ -42,3 +46,29 @@ def test_fp8_dequantizes_32_by_32_tiles() -> None:
 
     assert torch.equal(got[:, :32], torch.ones((32, 32)))
     assert torch.equal(got[:, 32:], torch.full((32, 32), 2.0))
+
+
+def test_fp8_quantization_uses_released_tile_schema() -> None:
+    source = torch.cat([torch.full((32, 32), 3.0), torch.full((32, 32), 900.0)], dim=1)
+    template = torch.empty((32, 64), dtype=torch.float8_e4m3fn)
+    template_scale = torch.empty((1, 2), dtype=torch.float8_e8m0fnu)
+
+    quantized, scale = quantize_released_weight(source, template, template_scale)
+    restored = dequantize_released_weight(quantized, scale, dtype=torch.float32)
+
+    assert quantized.dtype == template.dtype
+    assert scale.dtype == template_scale.dtype
+    assert torch.allclose(restored, source, rtol=0.02, atol=0.02)
+
+
+def test_mxfp4_quantization_packs_low_nibble_first() -> None:
+    pattern = torch.tensor([1.0, -1.0] * 16).reshape(1, 32)
+    template = torch.empty((1, 16), dtype=torch.int8)
+    template_scale = torch.empty((1, 1), dtype=torch.float8_e8m0fnu)
+
+    quantized, scale = quantize_released_weight(pattern, template, template_scale)
+    restored = dequantize_released_weight(quantized, scale, dtype=torch.float32)
+
+    # The chosen E8M0 scale is 0.25, so +/-1 use the +/-4 codepoints (6/E).
+    assert torch.equal(quantized.view(torch.uint8), torch.full((1, 16), 0xE6))
+    assert torch.equal(restored, pattern)

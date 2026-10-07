@@ -73,8 +73,8 @@ class MhcDecoderBlock(nn.Module):
         block_freqs: torch.Tensor,
         context_freqs: torch.Tensor,
         attn_bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """``streams [N, gamma, hc, dim]`` -> ``[N, gamma, hc, dim]``.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return updated streams and this block's FFN pre-mix.
 
         ``context_x [N, W, dim]`` is the shared target-hidden context (``main_x``).
         """
@@ -97,7 +97,9 @@ class MhcDecoderBlock(nn.Module):
             _sub["post_attn"] = streams.detach().float().cpu()
 
         residual = streams
-        post, comb, x = _prof("mHC.ffn", lambda: self.ffn_hc(streams))
+        post, comb, x, ffn_pre = _prof(
+            "mHC.ffn", lambda: self.ffn_hc(streams, return_pre=True)
+        )
         if _sub is not None:
             _sub["hc_pre_ffn"] = x.detach().float().cpu()
         x = self.ffn_norm(x)
@@ -110,4 +112,4 @@ class MhcDecoderBlock(nn.Module):
         if _sub is not None:
             _sub["layer_out"] = streams.detach().float().cpu()
             _SAT_SUB.append(_sub)
-        return streams
+        return streams, ffn_pre

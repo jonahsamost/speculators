@@ -14,7 +14,7 @@ under the additive ``attention_mask`` (block-diagonal + sliding window). Our
 existing ``MhcDecoderBlock`` forward already implements exactly this shape
 (``block_x``, ``context_x``, per-position freqs, ``attn_bias``); this module
 only wires the RoPE positions and mask, and manages the mHC streams across the
-stack (expand once, collapse with the HyperHead at the end).
+stack (expand once, collapse with the final FFN boundary's pre-mix at the end).
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from speculators.models.dspark.core import DSparkDraftModel
 # mishandles two-level ones (``from .backbone.block`` -> looks for the file
 # ``backbone.block.py``). Absolute imports are not parsed, so save_pretrained works.
 from speculators.models.dsv4_dspark.backbone.block import MhcDecoderBlock
-from speculators.models.dsv4_dspark.backbone.hyper import HyperHead
+from speculators.models.dsv4_dspark.backbone.hyper import collapse_streams
 from speculators.models.dsv4_dspark.backbone.rotary import precompute_freqs_cis
 from speculators.models.dsv4_dspark.config import DSparkDraftConfig
 
@@ -142,11 +142,12 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         # run by slowing the step to the serve's HS-production rate). See _backbone_forward.
         self.grad_checkpoint = bool(int(os.environ.get("DSPARK_RECOMPUTE", "0")))
 
-        # Swap the decoder stack for our DSV4-native blocks + the mHC head.
+        # Swap the decoder stack for our DSV4-native blocks. DeepSeek V4.1 has
+        # no standalone terminal mHC head; the final layer's FFN pre-mix is
+        # reused to collapse the residual streams.
         self.layers = nn.ModuleList(
             MhcDecoderBlock(bb) for _ in range(bb.n_draft_layers)
         )
-        self.hc_head = HyperHead(bb)
 
         # Our interleaved DSV4 RoPE cache, indexed by absolute position (YaRN off on the sliding
         # path -> original_seq_len=0). Stored as a REAL [seqlen, rope//2, 2] tensor (view_as_real
@@ -498,7 +499,7 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         if any(p.is_meta for p in self.parameters()):
             return
         std = 0.02
-        for m in [*self.layers, self.hc_head]:
+        for m in self.layers:
             for name, p in m.named_parameters():
                 if p.dim() >= 2 and (
                     ".fn" in name or "weight" in name or "hc_fn" in name
@@ -714,6 +715,7 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             for _layer in self.layers:
                 _layer.ffn.router.update_load_balance_bias()
 
+        final_ffn_pre = None
         for layer_idx, layer in enumerate(self.layers):
             attn_bias = (
                 sliding_window_attn_mask
@@ -733,9 +735,11 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                 # correctly under the saved-tensor hooks (standard AC+EP; the a2a re-runs in bwd).
                 from torch.utils.checkpoint import checkpoint  # noqa: PLC0415
 
-                streams = checkpoint(layer, *layer_args, use_reentrant=False)
+                streams, final_ffn_pre = checkpoint(
+                    layer, *layer_args, use_reentrant=False
+                )
             else:
-                streams = layer(*layer_args)
+                streams, final_ffn_pre = layer(*layer_args)
             if _sat:
                 _rec["layers"].append(streams.detach().float().cpu())
 
@@ -776,7 +780,11 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
 
         if _sat:
             self._satdumped = True
-            _rec["hc_head_out"] = self.hc_head(streams).detach().float().cpu()
+            assert final_ffn_pre is not None
+            _rec["final_ffn_pre"] = final_ffn_pre.detach().float().cpu()
+            _rec["head_hidden"] = (
+                collapse_streams(streams, final_ffn_pre).detach().float().cpu()
+            )
             _rec["substages"] = _blkmod._SAT_SUB
             _blkmod._SAT_SUB = None
             _sdir = os.environ.get(
@@ -786,11 +794,13 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             torch.save(_rec, os.path.join(_sdir, "train_sat.pt"))
             print(
                 f">>> [DSPARK_SATDUMP] train: embed + {len(_rec['layers'])} layers "
-                f"({len(_rec['substages'])} sub-staged) + hc_head → {_sdir}/train_sat.pt",
+                f"({len(_rec['substages'])} sub-staged) + final ffn pre-mix "
+                f"→ {_sdir}/train_sat.pt",
                 flush=True,
             )
 
-        hidden = self.norm(self.hc_head(streams))  # [1, TB, H]
+        assert final_ffn_pre is not None
+        hidden = self.norm(collapse_streams(streams, final_ffn_pre))  # [1, TB, H]
         logits = self.lm_head(hidden)
 
         # ── DSPARK_TRAIN_PARITY_DUMP=1: one-shot, rank0 — write the FIRST anchor's block in the

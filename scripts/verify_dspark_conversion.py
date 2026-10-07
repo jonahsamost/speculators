@@ -57,12 +57,10 @@ def expected_source_key(mtp_key: str, last: int):
         return ("hidden_norm.weight", None)
     if mtp_key == f"mtp.{last}.norm.weight":
         return ("norm.weight", None)
-    m = re.fullmatch(rf"mtp\.{last}\.markov_head\.(.*)", mtp_key)
-    if m:
-        return (f"markov_head.{m.group(1)}", None)
-    m = re.fullmatch(rf"mtp\.{last}\.hc_head_(fn|base|scale)", mtp_key)
-    if m:
-        return (f"hc_head.hc_{m.group(1)}", None)
+    if mtp_key == f"mtp.{last}.markov_head.embed.weight":
+        return ("markov_head.markov_w1.weight", None)
+    if mtp_key == f"mtp.{last}.markov_head.head.weight":
+        return ("markov_head.markov_w2.weight", None)
     m = re.fullmatch(rf"mtp\.{last}\.confidence_head\.(.*)", mtp_key)
     if m:
         return (f"confidence_head.{m.group(1)}", None)  # serve ignores it, but it should still round-trip
@@ -150,4 +148,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
