@@ -104,6 +104,24 @@ def test_build_config_matches_released_v41_dspark() -> None:
     assert config.confidence_head_bias is False
 
 
+def test_native_attention_contract_survives_config_serialization() -> None:
+    config = _build_config()
+
+    reloaded = DSV4DSparkConfig.model_validate(config.model_dump())
+
+    assert reloaded.transformer_layer_config.num_hidden_layers == 3
+    assert reloaded.transformer_layer_config.layer_types == ["sliding_attention"] * 3
+    assert reloaded.transformer_layer_config.sliding_window == 128
+
+
+def test_native_config_can_save_pretrained(tmp_path) -> None:
+    config = _build_config()
+
+    config.save_pretrained(tmp_path)
+
+    assert (tmp_path / "config.json").is_file()
+
+
 def test_incomplete_released_config_is_rejected() -> None:
     source = _released_v41_text_config()
     del source["dspark_target_layer_ids"]

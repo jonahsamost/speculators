@@ -22,8 +22,9 @@ import os
 from typing import ClassVar, Literal
 
 import torch
-from pydantic import Field, model_validator
+from pydantic import Field, field_serializer, model_validator
 from torch import nn
+from transformers import PretrainedConfig
 
 from speculators import SpeculatorModelConfig
 from speculators.model import SpeculatorModel
@@ -54,6 +55,12 @@ class DSV4DSparkConfig(DSparkSpeculatorConfig):
     machinery needs (hidden_size, vocab_size, num_hidden_layers = draft depth,
     rms_norm_eps); the fields below configure our MLA + MoE + mHC backbone.
     """
+
+    # There is deliberately no valid zero-argument instance: a native DSpark
+    # config must carry the verifier-derived three-layer sliding-window layout.
+    # Transformers otherwise constructs ``self.__class__()`` while saving just
+    # to compare generation defaults, which trips the contract validator below.
+    has_no_defaults_at_init: ClassVar[bool] = True
 
     speculators_model_type: Literal["dsv4_dspark"] = "dsv4_dspark"  # type: ignore[assignment]
     architectures: list[str] = Field(default_factory=lambda: ["DSV4DSparkDraftModel"])
@@ -88,6 +95,20 @@ class DSV4DSparkConfig(DSparkSpeculatorConfig):
     hc_mult: int = 4
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
+
+    @field_serializer("transformer_layer_config")
+    def serialize_transformer_config(self, value: PretrainedConfig) -> dict:
+        """Preserve the complete mutated draft-layer attention contract.
+
+        The inherited DFlash serializer uses ``to_diff_dict()``.  For custom
+        verifier configs that method can compare against a freshly constructed
+        32-layer/full-attention default and omit our in-place draft mutations.
+        Reloading then silently recreates that default before this class's
+        validator correctly rejects it.  The nested shape carrier is small
+        metadata, so serialize it in full.
+        """
+
+        return value.to_dict()
 
     @model_validator(mode="after")
     def validate_native_attention_contract(self) -> DSV4DSparkConfig:
@@ -307,8 +328,16 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         embed_w = w["embed.weight"]
         lm_head_w = w.get("head.weight", embed_w)
 
-        if self.embed_tokens.weight.isnan().any():
-            self.embed_tokens.load_state_dict({"weight": embed_w})
+        # Full-vocabulary verifier-owned weights are intentionally omitted from
+        # draft checkpoints.  During HF's low-memory ``from_pretrained`` path,
+        # those missing meta parameters are materialized as finite zeros, so a
+        # NaN-only sentinel silently leaves both the draft embedding and frozen
+        # output projection at zero.  A zero lm_head is especially dangerous:
+        # the Markov head still learns, but every gradient into the drafter
+        # backbone is exactly zero.  Restore omitted verifier-owned weights
+        # unconditionally.  A reduced-vocabulary lm_head is serialized and is
+        # therefore preserved below.
+        self.embed_tokens.load_state_dict({"weight": embed_w})
         if self.use_draft_vocab:
             if self.t2d is None or not torch.any(self.t2d).item():
                 raise ValueError(
@@ -317,7 +346,7 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             lm_head_w = lm_head_w[
                 self.t2d.to(device=lm_head_w.device, dtype=torch.bool), :
             ]
-        if self.lm_head.weight.isnan().any():
+        if not self.use_draft_vocab or self.lm_head.weight.isnan().any():
             self.lm_head.load_state_dict(
                 {"weight": lm_head_w.detach().clone()}, strict=False
             )

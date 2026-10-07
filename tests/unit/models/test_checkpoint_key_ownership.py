@@ -17,6 +17,7 @@ from speculators.models.dflash import DFlashSpeculatorConfig
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.config import DSparkSpeculatorConfig
 from speculators.models.dspark.core import DSparkDraftModel
+from speculators.models.dsv4_dspark.core import DSV4DSparkDraftModel
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 
 if TYPE_CHECKING:
@@ -170,3 +171,48 @@ def test_checkpoint_weights_take_precedence(monkeypatch: pytest.MonkeyPatch):
 
     assert torch.equal(model.embed_tokens.weight, expected_embed)
     assert torch.equal(model.lm_head.weight, expected_head)
+
+
+def test_dsv4_full_vocab_restores_zero_materialized_verifier_weights(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """HF meta loading materializes omitted weights as zeros, not NaNs."""
+
+    model = DSV4DSparkDraftModel.__new__(DSV4DSparkDraftModel)
+    nn.Module.__init__(model)
+    model.config = cast(
+        "Any",
+        SimpleNamespace(
+            speculators_config=SimpleNamespace(
+                verifier=SimpleNamespace(name_or_path="dummy")
+            )
+        ),
+    )
+    model.embed_tokens = nn.Embedding(VERIFIER_VOCAB, 16)
+    model.lm_head = nn.Linear(16, VERIFIER_VOCAB, bias=False)
+    model.verifier_lm_head = nn.Linear(16, VERIFIER_VOCAB, bias=False)
+    model.verifier_norm = nn.LayerNorm(16, elementwise_affine=True, bias=False)
+    model.use_draft_vocab = False
+    model.t2d = None
+    model.d2t = None
+    with torch.no_grad():
+        model.embed_tokens.weight.zero_()
+        model.lm_head.weight.zero_()
+        model.verifier_lm_head.weight.zero_()
+
+    fake = {
+        "embed.weight": torch.randn(VERIFIER_VOCAB, 16),
+        "head.weight": torch.randn(VERIFIER_VOCAB, 16),
+        "norm.weight": torch.randn(16),
+    }
+    monkeypatch.setattr(
+        "speculators.utils.loading.load_model_layers",
+        _make_fake_loader(fake),
+    )
+
+    model.load_verifier_weights()
+
+    assert torch.equal(model.embed_tokens.weight, fake["embed.weight"])
+    assert torch.equal(model.lm_head.weight, fake["head.weight"])
+    assert torch.equal(model.verifier_lm_head.weight, fake["head.weight"])
+    assert torch.equal(model.verifier_norm.weight, fake["norm.weight"])

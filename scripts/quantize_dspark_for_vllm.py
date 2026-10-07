@@ -37,7 +37,7 @@ def _weight_map(root: Path) -> dict[str, str]:
     single = root / "model.safetensors"
     if single.exists():
         with safe_open(str(single), framework="pt", device="cpu") as handle:
-            return dict.fromkeys(handle, single.name)
+            return dict.fromkeys(handle.keys(), single.name)
     raise SystemExit(f"no model.safetensors[.index.json] in {root}")
 
 
