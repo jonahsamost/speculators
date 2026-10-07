@@ -3,10 +3,11 @@
 Self-contained, backend-agnostic dataclass config for the DeepSeek-V4-Flash
 DSpark *draft* (the semi-autoregressive drafter trained on cached target
 hidden states). Values are the released
-``deepseek-ai/DeepSeek-V4-Flash-DSpark/inference/config.json`` (read
-2026-07-10); see ``docs/deployment/ascend-npu-dsv4-dspark-landing-plan.md`` §2.
+``deepseek-ai/DeepSeek-V4.1-Flash/config.json`` (read 2026-10-07).
+Conversion still reads every value from the checkpoint rather than relying on
+these defaults.
 
-The draft reuses the target's decoder-layer *shape* (MLA + sink + 256-expert
+The draft reuses the target's decoder-layer *shape* (MLA + sink + 128-expert
 MoE + hyper-connections) but is a small stack (``n_draft_layers`` = 3) with
 extra DSpark parts (``main_proj`` conditioning, Markov + confidence heads).
 This config carries both the backbone shape and the DSpark-method knobs; it is
@@ -36,8 +37,8 @@ class DSparkDraftConfig:
 
     # ---- vocabulary / hidden ------------------------------------------------
     vocab_size: int = 129280
-    hidden_size: int = 4096
-    rms_norm_eps: float = 1e-6
+    hidden_size: int = 5120
+    rms_norm_eps: float = 1e-20
 
     # ---- draft stack --------------------------------------------------------
     n_draft_layers: int = 3  # official n_mtp_layers
@@ -46,14 +47,14 @@ class DSparkDraftConfig:
     # released checkpoint's dspark_block_size.
     block_size: int = 5
     noise_token_id: int = 128799  # fills draft_input_ids[:, 1:] (the gamma mask slots)
-    target_layer_ids: tuple[int, ...] = (40, 41, 42)  # verifier layers -> main_proj
+    target_layer_ids: tuple[int, ...] = (37, 38, 39)  # verifier layers -> main_proj
     markov_rank: int = 256
 
     # ---- multi-head latent attention (MLA) ----------------------------------
     num_heads: int = 64
     head_dim: int = 512  # per-head q/k/v width (nope | rope)
     rope_head_dim: int = 64  # trailing rope slice of head_dim
-    q_lora_rank: int = 1024  # low-rank query bottleneck (wq_a -> wq_b)
+    q_lora_rank: int = 1280  # low-rank query bottleneck (wq_a -> wq_b)
     o_lora_rank: int = 1024  # grouped output bottleneck (wo_a -> wo_b)
     o_groups: int = 8  # head groups for the grouped output projection
     window_size: int = 128  # sliding-window context the draft attends to
@@ -65,10 +66,10 @@ class DSparkDraftConfig:
     beta_slow: float = 1.0
 
     # ---- mixture of experts -------------------------------------------------
-    n_routed_experts: int = 256
+    n_routed_experts: int = 128
     n_shared_experts: int = 1
-    n_activated_experts: int = 6  # top-k
-    moe_inter_dim: int = 2048
+    n_activated_experts: int = 3  # top-k
+    moe_inter_dim: int = 2304
     score_func: str = "sqrtsoftplus"  # router scoring
     route_scale: float = 1.5
     swiglu_limit: float = 10.0

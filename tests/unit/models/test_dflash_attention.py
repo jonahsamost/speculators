@@ -124,3 +124,28 @@ def test_create_mask_each_query_sees_its_own_block():
     )
 
     assert bool(dense[0, 0].any(dim=-1).all())
+
+
+def test_dspark_window_is_128_and_query_block_is_bidirectional():
+    """Pin the native DSV4 train/serve attention boundary.
+
+    At anchor 150, base context begins at 150 - 128 = 22 and ends at 149.
+    The five synthetic DSpark queries can all attend to one another.
+    """
+    total_seq_len, block_size, window = 200, 5, 128
+    document_ids = _lengths_to_document_ids(
+        torch.tensor([total_seq_len]), total_seq_len
+    )
+    dense = _dense_from_create_mask(
+        document_ids,
+        total_seq_len,
+        torch.tensor([150]),
+        block_size,
+        sliding_window=window,
+        sliding_window_non_causal=True,
+    )[0, 0]
+
+    assert not bool(dense[:, 21].any())
+    assert bool(dense[:, 22:150].all())
+    assert not bool(dense[:, 150:total_seq_len].any())
+    assert bool(dense[:, total_seq_len:].all())

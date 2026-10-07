@@ -1,6 +1,6 @@
 """Mixture-of-experts FFN for the DSV4 DSpark draft backbone.
 
-``256`` routed experts (SwiGLU with a magnitude clamp) + ``1`` shared expert,
+``128`` routed experts (SwiGLU with a magnitude clamp) + ``1`` shared expert,
 top-``k`` routing with ``sqrtsoftplus`` scoring. The draft layers are all
 score-routed (hash routing only applies to the target's first few layers, which
 the draft does not include), so no token-id / hash path is needed here.
@@ -9,7 +9,7 @@ Routed experts are held as **stacked weights** (:class:`GroupedExperts`:
 ``w1/w3 [E, inter, dim]``, ``w2 [E, dim, inter]``) rather than a ``ModuleList`` of
 per-expert Linears. This is the layout expert-parallelism and the grouped-matmul
 kernel both want (one ``Shard(0)`` DTensor per projection under EP; a single
-grouped GEMM instead of a 256-way loop). The heavy dispatch is routed through
+grouped GEMM instead of a 128-way loop). The heavy dispatch is routed through
 :mod:`.kernels` under the op ``moe_dispatch``: the pure-torch reference here loops
 over experts (correct, CPU-parity), and the NPU bridge registers a fused
 grouped-GEMM (``moe_grouped_gemm``) / expert-parallel all-to-all (``moe_ep``) under

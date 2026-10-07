@@ -23,7 +23,7 @@ import os
 from typing import ClassVar, Literal
 
 import torch
-from pydantic import Field
+from pydantic import Field, model_validator
 from torch import nn
 
 from speculators import SpeculatorModelConfig
@@ -55,12 +55,16 @@ class DSV4DSparkConfig(DSparkSpeculatorConfig):
     speculators_model_type: Literal["dsv4_dspark"] = "dsv4_dspark"  # type: ignore[assignment]
     architectures: list[str] = Field(default_factory=lambda: ["DSV4DSparkDraftModel"])
     confidence_head_bias: bool = False
+    # Runtime evaluates the gamma query block in parallel: each query can see
+    # all synthetic positions in its own block, while target-hidden context is
+    # restricted to the preceding sliding window.
+    sliding_window_non_causal: bool = True
 
     # multi-head latent attention
     num_heads: int = 64
     head_dim: int = 512
     rope_head_dim: int = 64
-    q_lora_rank: int = 1024
+    q_lora_rank: int = 1280
     o_lora_rank: int = 1024
     o_groups: int = 8
     window_size: int = 128
@@ -70,10 +74,10 @@ class DSV4DSparkConfig(DSparkSpeculatorConfig):
     beta_fast: float = 32.0
     beta_slow: float = 1.0
     # mixture of experts
-    n_routed_experts: int = 256
+    n_routed_experts: int = 128
     n_shared_experts: int = 1
-    n_activated_experts: int = 6
-    moe_inter_dim: int = 2048
+    n_activated_experts: int = 3
+    moe_inter_dim: int = 2304
     score_func: str = "sqrtsoftplus"
     route_scale: float = 1.5
     swiglu_limit: float = 10.0
@@ -81,6 +85,37 @@ class DSV4DSparkConfig(DSparkSpeculatorConfig):
     hc_mult: int = 4
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
+
+    @model_validator(mode="after")
+    def validate_native_attention_contract(self) -> DSV4DSparkConfig:
+        """Require the same all-sliding attention contract used by vLLM.
+
+        Native DeepSeek DSpark layers are the trailing ``compress_ratios == 0``
+        layers of the fused model and each uses ``sliding_window``.  The shared
+        DFlash training scaffold chooses its mask from ``layer_types``, while
+        the native backbone exposes ``window_size``.  Reject any checkpoint
+        where those two representations disagree instead of training a model
+        that cannot be served faithfully.
+        """
+        tl = self.transformer_layer_config
+        num_layers = int(tl.num_hidden_layers)
+        expected_types = ["sliding_attention"] * num_layers
+        actual_types = list(getattr(tl, "layer_types", None) or [])
+        nested_window = getattr(tl, "sliding_window", None)
+        if (
+            actual_types != expected_types
+            or nested_window != self.window_size
+            or not self.sliding_window_non_causal
+        ):
+            raise ValueError(
+                "native DSV4 DSpark requires a bidirectional query block and "
+                "every draft layer to use the same sliding window: expected "
+                f"layer_types={expected_types}, sliding_window=window_size="
+                f"{self.window_size}, and sliding_window_non_causal=True; got "
+                f"layer_types={actual_types}, sliding_window={nested_window}, and "
+                f"sliding_window_non_causal={self.sliding_window_non_causal}"
+            )
+        return self
 
     def backbone_config(self) -> DSparkDraftConfig:
         """Build the plain backbone dataclass our modules consume."""
@@ -653,16 +688,19 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             # it's a per-dimension `~w²` RESHAPING of the teacher hidden (flips the teacher argmax ~16%
             # vs the real verifier — T1). Why the reshaping helps the tail is not understood; empirical.
             # Off by default (single-norm); set =1 to reproduce/A-B the double-norm win.
-            _teacher_h = verifier_last_hidden_states
+            target_indices = (
+                anchored_block_indices
+                if self.config.sample_from_anchor
+                else (anchored_block_indices - 1) % total_seq_len
+            )
+            # Project only supervised anchor/slot positions.  Applying the
+            # 129k-vocabulary LM head to the full sequence first materializes
+            # an unnecessary [sequence_length, vocabulary] tensor (roughly
+            # 10.7 GiB in BF16 at 32k tokens).
+            _teacher_h = verifier_last_hidden_states[:, target_indices]
             if os.environ.get("DSPARK_TEACHER_DOUBLE_NORM") == "1":
                 _teacher_h = self.verifier_norm(_teacher_h)
-            verifier_logits = self.verifier_lm_head(_teacher_h)
-            if not self.config.sample_from_anchor:
-                # False: shift right by 1 so slot j predicts the token AT position j
-                # (slot 0 = the given anchor). True (DSpark, matches the vllm-ascend
-                # serve): NO shift — slot k predicts the NEXT token (position k+1).
-                verifier_logits = torch.roll(verifier_logits, 1, dims=1)
-            targets = verifier_logits[:, anchored_block_indices]
+            targets = self.verifier_lm_head(_teacher_h)
 
         # DSV4 RoPE freqs at the ctx and block absolute positions.
         ctx_freqs = self._rope_at(ctx_positions)
