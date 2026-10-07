@@ -24,6 +24,9 @@ from functools import lru_cache
 
 import torch
 
+_SHARED_FREQS_RANK = 3
+_BATCHED_FREQS_RANK = 4
+
 
 @lru_cache(maxsize=4)
 def precompute_freqs_cis(
@@ -96,14 +99,34 @@ def apply_rotary_emb(
     sin = freqs_cis[..., 1].repeat_interleave(2, dim=-1)
     if inverse:
         sin = -sin
-    # Broadcast cos/sin over batch + any head dims: shape [1, S, (1,)*extra, rope_dim].
+    # Broadcast cos/sin over batch + any head dims. ``freqs_cis`` may either be
+    # shared across the batch (``[S, rope_dim//2, 2]``) or carry independent
+    # absolute positions for every batch item (``[B, S, rope_dim//2, 2]``).
+    # The latter is used by anchor-local DSpark training: each anchor is an
+    # independent batch item whose 128-token context starts at a different
+    # absolute position.
     seq_len = x.shape[1]
-    extra = x.ndim - 2  # dims between the seq axis and the rope axis
-    view_shape = (
-        (1, seq_len, *([1] * (extra - 1)), x.shape[-1])
-        if extra >= 1
-        else (1, seq_len, x.shape[-1])
-    )
+    if freqs_cis.ndim == _SHARED_FREQS_RANK:
+        batch = 1
+    elif freqs_cis.ndim == _BATCHED_FREQS_RANK:
+        batch = freqs_cis.shape[0]
+        if batch not in (1, x.shape[0]):
+            raise ValueError(
+                "batched rotary frequencies must have batch size 1 or match x: "
+                f"got freqs={tuple(freqs_cis.shape)}, x={tuple(x.shape)}"
+            )
+    else:
+        raise ValueError(
+            "rotary frequencies must be [S, D/2, 2] or [B, S, D/2, 2], "
+            f"got {tuple(freqs_cis.shape)}"
+        )
+    if freqs_cis.shape[-3] != seq_len:
+        raise ValueError(
+            "rotary frequency sequence length must match x: "
+            f"got freqs={tuple(freqs_cis.shape)}, x={tuple(x.shape)}"
+        )
+    # x is [B, S, ..., D]. Insert singleton axes for any head/stream dims.
+    view_shape = (batch, seq_len, *([1] * (x.ndim - 3)), x.shape[-1])
     cos = cos.reshape(*view_shape).float()
     sin = sin.reshape(*view_shape).float()
     xf = x.float()

@@ -208,7 +208,13 @@ class DataArgs(_Group):
         json_schema_extra=_CLI_CHOICES,
     )
     total_seq_len: int = Field(
-        default=8192, description="Maximum training sequence length, in tokens."
+        default=8192,
+        description=(
+            "Maximum number of verifier tokens packed into one data batch. This is "
+            "the hidden-state extraction and transport chunk size, not necessarily "
+            "the draft model's attention length; windowed drafters such as native "
+            "DSV4 DSpark train each anchor on their configured local window."
+        ),
     )
     train_data_ratio: float = Field(
         default=0.9,

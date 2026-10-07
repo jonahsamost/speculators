@@ -5,16 +5,15 @@ and override ONLY the decoder stack inside ``_backbone_forward``: the anchor
 sampling, target-distribution computation, Markov + confidence heads, compound
 loss, registration, ``from_training_args`` and the data contract are all
 inherited verbatim. In place of the Qwen3 DFlash decoder layers we run our
-clean-room DSV4 stack — multi-head latent attention + per-head sink + 256-expert
+clean-room DSV4 stack — multi-head latent attention + per-head sink + 128-expert
 MoE + hyper-connections — with our interleaved DSV4 RoPE.
 
-The block-attention contract is identical to DFlash's: the draft block queries
-(``noise_embedding [1, TB, H]``) attend to ``[target-hidden context | block]``
-under the additive ``attention_mask`` (block-diagonal + sliding window). Our
-existing ``MhcDecoderBlock`` forward already implements exactly this shape
-(``block_x``, ``context_x``, per-position freqs, ``attn_bias``); this module
-only wires the RoPE positions and mask, and manages the mHC streams across the
-stack (expand once, collapse with the final FFN boundary's pre-mix at the end).
+Each selected anchor is an independent training batch item. Its five draft
+queries attend to exactly ``[the preceding 128 target-hidden states | its own
+five-query block]``. Keeping that window explicit makes draft-layer memory
+independent of the verifier sequence length while preserving the contextualized
+hidden states and absolute RoPE positions produced from the original long
+sequence.
 """
 
 from __future__ import annotations
@@ -28,6 +27,10 @@ from torch import nn
 
 from speculators import SpeculatorModelConfig
 from speculators.model import SpeculatorModel
+from speculators.models.dflash.utils import (
+    get_base_indices_for_anchored_blocks,
+    select_anchors,
+)
 from speculators.models.dspark.config import DSparkSpeculatorConfig
 from speculators.models.dspark.core import DSparkDraftModel
 
@@ -630,6 +633,61 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             self._rebuild_freqs(int(positions.max()) + 1)
         return self.freqs_cis.to(positions.device)[positions]
 
+    @staticmethod
+    def _anchor_local_context(
+        anchor_positions: torch.Tensor,
+        anchor_valid: torch.Tensor,
+        document_ids: torch.Tensor,
+        window_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return safe gather indices and validity for each anchor's context.
+
+        The old DFlash mask exposed base positions in
+        ``[anchor - window_size, anchor)`` only when they belonged to the
+        anchor's packed document. Materialize precisely those indices as
+        ``[num_anchors, window_size]``. Invalid/left-padded slots gather index
+        zero but are masked out before attention, so they cannot affect output.
+        """
+        if window_size <= 0:
+            raise ValueError(f"window_size must be positive, got {window_size}")
+        anchors = anchor_positions.to(dtype=torch.long).reshape(-1)
+        valid_anchors = anchor_valid.to(dtype=torch.bool).reshape(-1)
+        docs = document_ids.reshape(-1)
+        offsets = torch.arange(-window_size, 0, dtype=torch.long, device=anchors.device)
+        indices = anchors[:, None] + offsets[None, :]
+        in_bounds = (indices >= 0) & (indices < docs.numel())
+        safe_indices = indices.clamp(0, max(docs.numel() - 1, 0))
+        anchor_docs = docs[anchors.clamp(0, max(docs.numel() - 1, 0))]
+        context_docs = docs[safe_indices]
+        context_valid = (
+            in_bounds
+            & valid_anchors[:, None]
+            & (anchor_docs[:, None] != -1)
+            & (context_docs == anchor_docs[:, None])
+        )
+        return safe_indices, context_valid
+
+    @staticmethod
+    def _anchor_local_attention_bias(
+        context_valid: torch.Tensor,
+        block_size: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Additive mask for ``[local context | own bidirectional block]``."""
+        num_anchors, window_size = context_valid.shape
+        allowed_context = context_valid[:, None, :].expand(
+            num_anchors, block_size, window_size
+        )
+        allowed_block = torch.ones(
+            (num_anchors, block_size, block_size),
+            dtype=torch.bool,
+            device=context_valid.device,
+        )
+        allowed = torch.cat((allowed_context, allowed_block), dim=-1)
+        return torch.zeros(
+            allowed.shape, dtype=dtype, device=allowed.device
+        ).masked_fill(~allowed, float("-inf"))
+
     def _backbone_forward(  # noqa: C901
         self,
         hidden_states: torch.Tensor,
@@ -651,8 +709,12 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                 total_seq_len, dtype=torch.long, device=device
             ).unsqueeze(0)
 
-        full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid = (
-            self._build_attention_mask(loss_mask, num_anchors, document_ids, device)
+        # Select anchors exactly as the shared DFlash scaffold does, but do not
+        # construct its sequence-sized QxK mask. Native DSV4 DSpark is all
+        # sliding attention, so each anchor can be represented directly as an
+        # independent local window.
+        anchor_positions, anchor_valid = select_anchors(
+            loss_mask, num_anchors, self.block_size
         )
 
         mask_tokens_size = num_anchors * self.block_size
@@ -660,17 +722,29 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             (1, mask_tokens_size), self.mask_token_id, dtype=torch.long, device=device
         )
         mask_token_ids[:, :: self.block_size] = input_ids[:, anchor_positions]
-        noise_embedding = self.embed_tokens(mask_token_ids)  # [1, TB, H]
+        noise_embedding = self.embed_tokens(mask_token_ids).view(
+            num_anchors, self.block_size, -1
+        )  # [A, B, H]
 
-        fc_output = self.fc(hidden_states)
-        fc_output = self.hidden_norm(fc_output)  # [1, T, H]  (main_x context)
-
-        from speculators.models.dflash.utils import get_base_indices_for_anchored_blocks
+        context_indices, context_valid = self._anchor_local_context(
+            anchor_positions,
+            anchor_valid,
+            document_ids[0],
+            self.backbone_cfg.window_size,
+        )
+        # Project the source chunk once, then gather overlapping H-wide local
+        # windows. The source chunk is still the transport/packing unit, but it
+        # is no longer the draft transformer's attention sequence.
+        projected_context = self.hidden_norm(self.fc(hidden_states))  # [1, T, H]
+        local_context = projected_context[0, context_indices]  # [A, W, H]
+        local_attn_bias = self._anchor_local_attention_bias(
+            context_valid, self.block_size, projected_context.dtype
+        )
 
         block_positions = get_base_indices_for_anchored_blocks(
             position_ids[0, anchor_positions], self.block_size
-        )  # [TB]
-        ctx_positions = position_ids[0]  # [T]
+        ).view(num_anchors, self.block_size)  # [A, B]
+        context_positions = position_ids[0, context_indices]  # [A, W]
 
         anchored_block_indices = get_base_indices_for_anchored_blocks(
             anchor_positions, self.block_size
@@ -703,12 +777,12 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             targets = self.verifier_lm_head(_teacher_h)
 
         # DSV4 RoPE freqs at the ctx and block absolute positions.
-        ctx_freqs = self._rope_at(ctx_positions)
+        ctx_freqs = self._rope_at(context_positions)
         block_freqs = self._rope_at(block_positions)
 
         # mHC streams across the stack; each block attends noise -> [ctx | block].
         hc = self.backbone_cfg.hc_mult
-        streams = noise_embedding.unsqueeze(2).repeat(1, 1, hc, 1)  # [1, TB, hc, H]
+        streams = noise_embedding.unsqueeze(2).repeat(1, 1, hc, 1)  # [A, B, hc, H]
 
         # ── DSPARK_SATDUMP=1: one-shot per-stage capture mirroring the serve model.forward dump
         #    (deepseek_v4_dspark.py), so the two can be bisected layer-by-layer to the FIRST
@@ -754,18 +828,13 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                 _layer.ffn.router.update_load_balance_bias()
 
         final_ffn_pre = None
-        for layer_idx, layer in enumerate(self.layers):
-            attn_bias = (
-                sliding_window_attn_mask
-                if layer_idx in self.sliding_window_indices
-                else full_attn_mask
-            )
+        for layer in self.layers:
             layer_args = (
                 streams,
-                fc_output,
+                local_context,
                 block_freqs,
                 ctx_freqs,
-                self._mask_to_bias(attn_bias),
+                local_attn_bias,
             )
             if self.grad_checkpoint and self.training:
                 # Recompute this layer (attn + EP-MoE all-to-all + mHC) in backward to free its
@@ -838,7 +907,9 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             )
 
         assert final_ffn_pre is not None
-        hidden = self.norm(collapse_streams(streams, final_ffn_pre))  # [1, TB, H]
+        hidden = self.norm(collapse_streams(streams, final_ffn_pre)).reshape(
+            1, mask_tokens_size, -1
+        )  # [1, A*B, H]
         logits = self.lm_head(hidden)
 
         # ── DSPARK_TRAIN_PARITY_DUMP=1: one-shot, rank0 — write the FIRST anchor's block in the
@@ -932,13 +1003,3 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                         flush=True,
                     )
         return hidden, logits, targets, aligned_loss_mask, anchored_block_indices
-
-    @staticmethod
-    def _mask_to_bias(mask: torch.Tensor | None) -> torch.Tensor | None:
-        """Reshape the DFlash eager float mask to our sink attn_bias [1, TB, Sk]."""
-        if mask is None:
-            return None
-        # eager float mask is [1, 1, TB, Sk] (or [1, TB, Sk]); collapse the head dim.
-        while mask.dim() > 3:
-            mask = mask.squeeze(1)
-        return mask
