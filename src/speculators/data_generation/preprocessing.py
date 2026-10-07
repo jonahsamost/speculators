@@ -241,12 +241,40 @@ def _common_prefix_len(a: list[int], b: list[int]) -> int:
     return length
 
 
+def _drop_oldest_history_group(
+    messages: list[dict],
+) -> list[dict] | None:
+    """Drop the oldest complete group while preserving system/current turns."""
+
+    first_non_system = next(
+        (
+            index
+            for index, message in enumerate(messages)
+            if message["role"] != "system"
+        ),
+        len(messages),
+    )
+    user_indices = [
+        index
+        for index, message in enumerate(messages)
+        if index >= first_non_system and message["role"] == "user"
+    ]
+    if user_indices[1:]:
+        start, stop = user_indices[0], user_indices[1]
+    elif user_indices and first_non_system < user_indices[0]:
+        start, stop = first_non_system, user_indices[0]
+    else:
+        return None
+    return [*messages[:start], *messages[stop:]]
+
+
 def _render_boundary_rows(
     normalized_conv: list[dict],
     render_endpoint: str,
     max_length: int,
     *,
     tools: list[dict] | None = None,
+    completion_reserve_tokens: int = 0,
 ) -> list[BoundaryRow]:
     """Build one training row per assistant turn, masked at its render boundary.
 
@@ -265,6 +293,9 @@ def _render_boundary_rows(
     Raises:
         BoundaryUnstableError: the renders diverge inside history.
     """
+    if completion_reserve_tokens < 0 or completion_reserve_tokens >= max_length:
+        raise ValueError("completion_reserve_tokens must be in [0, max_length)")
+
     rows: list[BoundaryRow] = []
 
     for j, turn in enumerate(normalized_conv):
@@ -272,20 +303,35 @@ def _render_boundary_rows(
         if turn["role"] != "assistant" or j == 0:
             continue
 
-        prompt_ids = _encode_render(
-            normalized_conv[:j],
-            render_endpoint,
-            add_generation_prompt=True,
-            max_length=max_length,
-            tools=tools,
-        )
-        if len(prompt_ids) >= max_length:
-            # Not a break: templates that strip history reasoning (Qwen3,
-            # DeepSeek-R1) shrink the context, so a later turn can fit again.
+        history = normalized_conv[:j]
+        prompt_budget = max_length - completion_reserve_tokens
+        while True:
+            prompt_ids = _encode_render(
+                history,
+                render_endpoint,
+                add_generation_prompt=True,
+                max_length=max_length,
+                tools=tools,
+            )
+            if len(prompt_ids) < max_length and len(prompt_ids) <= prompt_budget:
+                break
+            if completion_reserve_tokens == 0:
+                # Not a break: templates that strip history reasoning (Qwen3,
+                # DeepSeek-R1) shrink the context, so a later turn can fit again.
+                history = []
+                break
+            shorter = _drop_oldest_history_group(history)
+            if shorter is None:
+                history = []
+                break
+            history = shorter
+        if not history:
             continue
 
+        full_conversation = [*history, turn]
+
         full_ids = _encode_render(
-            normalized_conv[: j + 1],
+            full_conversation,
             render_endpoint,
             add_generation_prompt=False,
             max_length=max_length,
@@ -298,7 +344,7 @@ def _render_boundary_rows(
             # the common prefix, valid only if history itself agrees (below).
             boundary = _common_prefix_len(prompt_ids, full_ids)
             hist_ids = _encode_render(
-                normalized_conv[:j],
+                history,
                 render_endpoint,
                 add_generation_prompt=False,
                 max_length=max_length,
@@ -314,7 +360,7 @@ def _render_boundary_rows(
             {
                 "input_ids": full_ids,
                 "loss_mask": [0] * boundary + [1] * (len(full_ids) - boundary),
-                "conv": normalized_conv[: j + 1],
+                "conv": full_conversation,
             }
         )
 
@@ -350,6 +396,7 @@ def _render_conversation_rows(
     idx: int,
     render_endpoint: str,
     max_length: int,
+    completion_reserve_tokens: int,
 ) -> list[BoundaryRow] | None:
     """Render one valid conversation; return ``None`` when it is unusable."""
     if not conv or not isinstance(conv, list):
@@ -366,6 +413,7 @@ def _render_conversation_rows(
             render_endpoint,
             max_length,
             tools=parsed_tools,
+            completion_reserve_tokens=completion_reserve_tokens,
         )
     # One row the render endpoint or boundary derivation can't handle must
     # not kill the run. The failure modes can't be enumerated -- templates
@@ -500,6 +548,7 @@ def _preprocess_batch(
     render_endpoint: str | None,
     max_length: int,
     minimum_valid_tokens: int | None = None,
+    completion_reserve_tokens: int = 0,
 ) -> dict[str, list]:
     """Convert on-policy conversations or speculator-format rows for training."""
 
@@ -552,6 +601,7 @@ def _preprocess_batch(
             idx,
             render_endpoint,
             max_length,
+            completion_reserve_tokens,
         )
         if rows is None:
             continue
@@ -594,6 +644,7 @@ def build_speculator_training_dataset(
     *,
     render_endpoint: str | None = None,
     minimum_valid_tokens: int | None = None,
+    completion_reserve_tokens: int = 0,
 ) -> HFDataset:
     """Build a speculator training dataset with render-boundary loss masks.
 
@@ -613,6 +664,9 @@ def build_speculator_training_dataset(
         render_endpoint: Base URL of a vLLM server. Required unless the dataset
             is already in speculator format.
         minimum_valid_tokens: Minimum supervised tokens for a row to be kept.
+        completion_reserve_tokens: For natural-language conversations, trim
+            oldest complete history groups until this many tokens remain for
+            the captured assistant completion.
     """
     original_cols = dataset.column_names
     # These rows carry their supervision mask, so _preprocess_batch passes them
@@ -644,6 +698,7 @@ def build_speculator_training_dataset(
                 render_endpoint,
                 max_length,
                 minimum_valid_tokens,
+                completion_reserve_tokens,
             ),
             batched=True,
             num_proc=num_proc,
@@ -828,6 +883,7 @@ def load_and_preprocess_dataset(
     token_freq_path: Path | str = "./token_freq.pt",  # noqa: S107
     render_endpoint: str | None = None,
     minimum_valid_tokens: int | None = None,
+    completion_reserve_tokens: int = 0,
     allow_empty_output: bool = False,
     trust_remote_code: bool = False,
     skip_token_freq: bool = True,
@@ -853,6 +909,8 @@ def load_and_preprocess_dataset(
             ``http://localhost:8000``) used to render conversations. Required
             unless every dataset is already in speculator format.
         minimum_valid_tokens: Number of tokens to consider for a valid sample
+        completion_reserve_tokens: Prompt headroom retained by dropping oldest
+            complete history groups before rendering a captured completion.
         allow_empty_output: If True, allow returning an empty dataset instead of
                           raising when no samples survive preprocessing.
         trust_remote_code: If True, allows executing code from HF Hub.
@@ -915,6 +973,7 @@ def load_and_preprocess_dataset(
             num_proc=build_dataset_num_proc,
             render_endpoint=render_endpoint,
             minimum_valid_tokens=minimum_valid_tokens,
+            completion_reserve_tokens=completion_reserve_tokens,
         )
         if minimum_valid_tokens is not None:
             log.info(f"Kept {len(preprocessed_dataset)} samples after filtering")

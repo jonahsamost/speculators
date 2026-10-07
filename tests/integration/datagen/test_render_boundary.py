@@ -150,6 +150,52 @@ def test_over_length_first_turn_yields_no_rows(monkeypatch):
     assert preprocessing._render_boundary_rows(_conv(4), "http://x", 10) == []
 
 
+def test_completion_reserve_drops_oldest_group_and_keeps_system_and_current_turn(
+    monkeypatch,
+):
+    conversation = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old user"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "current user"},
+        {"role": "assistant", "content": "current answer"},
+    ]
+
+    def fake(
+        conv_prefix,
+        render_endpoint,
+        *,
+        add_generation_prompt,
+        max_length=None,
+        tools=None,
+    ):
+        contents = [message["content"] for message in conv_prefix]
+        if contents == ["system", "old user"]:
+            return [1] * (4 if add_generation_prompt else 3)
+        if contents == ["system", "old user", "old answer"]:
+            return [1] * 6
+        if contents == ["system", "old user", "old answer", "current user"]:
+            return [1] * 9
+        if contents == ["system", "current user"]:
+            return [1] * (5 if add_generation_prompt else 4)
+        if contents == ["system", "current user", "current answer"]:
+            return [1] * 7
+        raise AssertionError(contents)
+
+    monkeypatch.setattr(preprocessing, "_encode_render", fake)
+
+    rows = preprocessing._render_boundary_rows(
+        conversation,
+        "http://x",
+        10,
+        completion_reserve_tokens=3,
+    )
+
+    assert len(rows) == 2
+    assert rows[-1]["conv"] == [conversation[0], conversation[3], conversation[4]]
+    assert rows[-1]["loss_mask"] == [0, 0, 0, 0, 0, 1, 1]
+
+
 # --------------------------------------------------------------------------- #
 # _append_row -- clip / filter / keep                                          #
 # --------------------------------------------------------------------------- #

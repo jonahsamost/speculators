@@ -20,6 +20,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from speculators.data_generation.configs import DATASET_CONFIGS, DatasetConfig
+from speculators.data_generation.preprocessing import _drop_oldest_history_group
 from speculators.data_generation.vllm_client import (
     DEFAULT_MAX_RETRIES,
     InvalidResponseError,
@@ -147,33 +148,6 @@ def extract_teacher_targets(
     if isinstance(prompt, str) and prompt:
         return [(0, [{"role": "user", "content": prompt}])]
     return []
-
-
-def _drop_oldest_history_group(
-    messages: list[dict[str, Any]],
-) -> list[dict[str, Any]] | None:
-    """Drop the oldest complete pre-current-user group, preserving system turns."""
-
-    first_non_system = next(
-        (
-            index
-            for index, message in enumerate(messages)
-            if message["role"] != "system"
-        ),
-        len(messages),
-    )
-    user_indices = [
-        index
-        for index, message in enumerate(messages)
-        if index >= first_non_system and message["role"] == "user"
-    ]
-    if user_indices[1:]:
-        start, stop = user_indices[0], user_indices[1]
-    elif user_indices and first_non_system < user_indices[0]:
-        start, stop = first_non_system, user_indices[0]
-    else:
-        return None
-    return [*messages[:start], *messages[stop:]]
 
 
 async def trim_teacher_prefix(

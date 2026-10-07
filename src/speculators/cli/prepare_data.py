@@ -140,6 +140,16 @@ def prepare_data(
             ),
         ),
     ] = None,
+    completion_reserve_tokens: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            help=(
+                "For captured conversations, reserve this many tokens for each "
+                "assistant completion by dropping oldest complete history groups."
+            ),
+        ),
+    ] = 0,
     overwrite: Annotated[
         bool,
         typer.Option(
@@ -233,6 +243,7 @@ def prepare_data(
         token_freq_path=resolved_token_freq_path,
         render_endpoint=render_endpoint,
         minimum_valid_tokens=minimum_valid_tokens,
+        completion_reserve_tokens=completion_reserve_tokens,
         allow_empty_output=allow_empty_output,
         trust_remote_code=trust_remote_code,
         skip_token_freq=skip_token_freq,
