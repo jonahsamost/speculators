@@ -28,6 +28,40 @@ _SHARED_FREQS_RANK = 3
 _BATCHED_FREQS_RANK = 4
 
 
+def freqs_cis_from_positions(
+    positions: torch.Tensor,
+    dim: int,
+    base: float,
+) -> torch.Tensor:
+    """Build fresh real interleaved RoPE cos/sin values for positions.
+
+    DSV4 training passes the same logical positions through several
+    activation-checkpointed draft layers. Returning fresh storage at the point
+    of use prevents one layer or backend operation from corrupting the rotary
+    input consumed by a later layer. The sliding-attention path does not use
+    YaRN, so the returned values are the ordinary base-theta rotation with
+    shape ``[*positions.shape, dim // 2, 2]``.
+    """
+    if dim <= 0 or dim % 2:
+        raise ValueError(f"RoPE dimension must be positive and even, got {dim}")
+    if positions.dtype not in {
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+    }:
+        raise TypeError(f"RoPE positions must be integral, got {positions.dtype}")
+
+    exponent = torch.arange(0, dim, 2, dtype=torch.float32, device=positions.device)
+    inv_freq = torch.pow(
+        torch.tensor(base, dtype=torch.float32, device=positions.device),
+        -(exponent / dim),
+    )
+    angles = positions.to(torch.float32).unsqueeze(-1) * inv_freq
+    return torch.stack((torch.cos(angles), torch.sin(angles)), dim=-1)
+
+
 @lru_cache(maxsize=4)
 def precompute_freqs_cis(
     dim: int,

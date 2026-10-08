@@ -64,5 +64,17 @@ def select_anchors(
     anchors[:k] = torch.sort(torch.gather(valid_indices, 0, perm[:k])).values
     anchor_valid[:k] = True
 
+    # Keep the fixed-shape compute batch numerically well-formed when a sample
+    # contains fewer than ``num_anchors`` supervised positions.  The remaining
+    # slots are still marked invalid (and therefore never contribute to the
+    # loss), but make them repeat real anchors instead of pointing at position
+    # zero.  Some draft backbones execute every fixed-shape slot before applying
+    # ``anchor_valid``; feeding a synthetic, fully-masked anchor through those
+    # paths can produce non-finite activations whose zero loss gradient still
+    # poisons parameter gradients (NaN * 0 is NaN).
+    if 0 < k < num_anchors:
+        padding = torch.arange(num_anchors - k, device=device) % k
+        anchors[k:] = anchors[padding]
+
     return anchors, anchor_valid
     # shape: [num_anchors], [num_anchors]

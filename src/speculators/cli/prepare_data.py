@@ -150,6 +150,16 @@ def prepare_data(
             ),
         ),
     ] = 0,
+    max_assistant_targets: Annotated[
+        int | None,
+        typer.Option(
+            min=1,
+            help=(
+                "Keep only the latest N assistant targets per conversation while "
+                "retaining each target's preceding history."
+            ),
+        ),
+    ] = None,
     overwrite: Annotated[
         bool,
         typer.Option(
@@ -244,6 +254,7 @@ def prepare_data(
         render_endpoint=render_endpoint,
         minimum_valid_tokens=minimum_valid_tokens,
         completion_reserve_tokens=completion_reserve_tokens,
+        max_assistant_targets=max_assistant_targets,
         allow_empty_output=allow_empty_output,
         trust_remote_code=trust_remote_code,
         skip_token_freq=skip_token_freq,

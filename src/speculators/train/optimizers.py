@@ -30,10 +30,40 @@ _ADAMW_NAME_HINTS = (
     "codebook",
     "markov_w1",
     "markov_w2",
+    "confidence_head",
 )
 
 # Muon only orthogonalizes 2D weight matrices.
 _MATRIX_NDIM = 2
+
+
+def _adamw_param_groups(
+    named_params: list[tuple[str, Tensor]],
+    *,
+    base_lr: float,
+    confidence_head_lr: float | None,
+) -> list[dict] | list[tuple[str, Tensor]]:
+    """Build AdamW groups, optionally giving confidence heads their own LR."""
+    if confidence_head_lr is None:
+        return named_params
+
+    base_params = [
+        param for name, param in named_params if "confidence_head" not in name
+    ]
+    confidence_params = [
+        param for name, param in named_params if "confidence_head" in name
+    ]
+    if not confidence_params:
+        raise ValueError(
+            "confidence_head_lr was set, but the model has no trainable "
+            "confidence_head parameters."
+        )
+
+    groups: list[dict] = []
+    if base_params:
+        groups.append({"params": base_params, "lr": base_lr})
+    groups.append({"params": confidence_params, "lr": confidence_head_lr})
+    return groups
 
 
 def split_named_params_for_muon(
@@ -75,9 +105,18 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
         "adamw" returns a single optimizer; "muon" returns ``[Muon, AdamW]``.
     """
     if config.optimizer == "adamw":
+        named_params = [
+            (name, param)
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        ]
         return [
             torch.optim.AdamW(
-                model.named_parameters(),
+                _adamw_param_groups(
+                    named_params,
+                    base_lr=config.lr,
+                    confidence_head_lr=config.confidence_head_lr,
+                ),
                 lr=config.lr,
                 weight_decay=config.weight_decay,
             )
@@ -106,7 +145,11 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
         if adamw_params:
             optimizers.append(
                 torch.optim.AdamW(
-                    adamw_params,
+                    _adamw_param_groups(
+                        adamw_params,
+                        base_lr=config.lr,
+                        confidence_head_lr=config.confidence_head_lr,
+                    ),
                     lr=config.lr,
                     weight_decay=config.weight_decay,
                 )

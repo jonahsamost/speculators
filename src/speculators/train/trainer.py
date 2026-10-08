@@ -88,18 +88,81 @@ def _nonfinite_gradient_names(model: SpeculatorModel) -> list[str]:
     return bad_names
 
 
-def _clip_grad_norm_or_raise(model: SpeculatorModel, max_norm: float) -> None:
-    """Clip gradients, reporting offending parameters before any optimizer step."""
-    try:
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(), max_norm, error_if_nonfinite=True
+def _gradient_replication_factor(gradient: torch.Tensor) -> int:
+    """Number of ranks holding each local value of a gradient.
+
+    FSDP2 exposes gradients as DTensors.  Sharded values must be counted once
+    in a global norm, while replicated values would otherwise be counted once
+    per replica by the all-reduce below.
+    """
+    placements = getattr(gradient, "placements", None)
+    device_mesh = getattr(gradient, "device_mesh", None)
+    if placements is None or device_mesh is None:
+        return dist.get_world_size() if dist.is_initialized() else 1
+
+    factor = 1
+    mesh_shape = device_mesh.mesh.shape
+    for mesh_dim, placement in enumerate(placements):
+        if placement.is_partial():
+            raise RuntimeError("Cannot clip a gradient with a partial DTensor placement")
+        if placement.is_replicate():
+            factor *= int(mesh_shape[mesh_dim])
+    return factor
+
+
+def _clip_grad_norm_or_raise(model: SpeculatorModel, max_norm: float) -> float:
+    """Clip gradients with an overflow-safe distributed L2 norm.
+
+    ``torch.nn.utils.clip_grad_norm_`` accumulates this model's multi-billion
+    parameter norm in fp32.  Large but individually finite gradients can make
+    that sum of squares overflow to infinity.  Accumulate local shard norms in
+    fp64, account for replicated DTensor placements, and then all-reduce one
+    scalar.  Genuinely non-finite gradient elements still fail before an
+    optimizer update.
+    """
+    gradients: list[tuple[torch.Tensor, torch.Tensor]] = []
+    bad_names = _nonfinite_gradient_names(model)
+    parameters = list(model.named_parameters())
+    for _name, parameter in parameters:
+        gradient = parameter.grad
+        if gradient is None:
+            continue
+        local_gradient = (
+            gradient.to_local() if hasattr(gradient, "to_local") else gradient
         )
-    except RuntimeError as error:
-        bad_names = _nonfinite_gradient_names(model)
+        gradients.append((gradient, local_gradient))
+
+    device = gradients[0][1].device if gradients else next(model.parameters()).device
+    any_bad = torch.tensor(bool(bad_names), dtype=torch.int32, device=device)
+    if dist.is_initialized():
+        dist.all_reduce(any_bad, op=dist.ReduceOp.MAX)
+    if bool(any_bad.item()):
         raise FloatingPointError(
-            "Non-finite gradient norm before the optimizer step. "
+            "Non-finite gradient before the optimizer step. "
             f"Parameters with non-finite local gradients: {bad_names}"
-        ) from error
+        )
+
+    total_squared = torch.zeros((), dtype=torch.float64, device=device)
+    for gradient, local_gradient in gradients:
+        local_norm = torch.linalg.vector_norm(
+            local_gradient, ord=2, dtype=torch.float64
+        )
+        total_squared.add_(
+            local_norm.square() / _gradient_replication_factor(gradient)
+        )
+    if dist.is_initialized():
+        dist.all_reduce(total_squared, op=dist.ReduceOp.SUM)
+
+    total_norm = total_squared.sqrt()
+    if not bool(torch.isfinite(total_norm).item()):
+        raise FloatingPointError(
+            f"Non-finite fp64 gradient norm before the optimizer step: {total_norm.item()}"
+        )
+
+    clip_coefficient = (max_norm / (total_norm + 1e-6)).clamp(max=1.0)
+    for _gradient, local_gradient in gradients:
+        local_gradient.mul_(clip_coefficient.to(dtype=local_gradient.dtype))
+    return float(total_norm.item())
 
 
 def _all_reduce_metrics(metrics: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -207,6 +270,7 @@ class TrainerConfig(NamedTuple):
     val_call_kwargs: dict | None = None
     optimizer: Literal["adamw", "muon"] = "adamw"
     weight_decay: float = 0.01
+    confidence_head_lr: float | None = None
     muon_lr: float = 0.02
     muon_momentum: float = 0.95
     muon_weight_decay: float = 0.1
@@ -602,22 +666,22 @@ class Trainer:
                 for k, v in batch.items()
             }
 
-            with torch.autocast(
-                self.device_type, dtype=self.config.hidden_states_dtype
-            ):
-                timer.mark("fetch")
-                _draft_tokens, loss, metrics = self.model(
-                    **gpu_batch, **(self.config.train_call_kwargs or {})
-                )
-
-            timer.mark("fwd")
-            self._optimizers_zero_grad()
             anomaly_context = (
                 torch.autograd.detect_anomaly(check_nan=True)
                 if os.environ.get("SPECULATORS_DETECT_ANOMALY") == "1"
                 else nullcontext()
             )
             with anomaly_context:
+                with torch.autocast(
+                    self.device_type, dtype=self.config.hidden_states_dtype
+                ):
+                    timer.mark("fetch")
+                    _draft_tokens, loss, metrics = self.model(
+                        **gpu_batch, **(self.config.train_call_kwargs or {})
+                    )
+
+                timer.mark("fwd")
+                self._optimizers_zero_grad()
                 loss.backward()
             timer.mark("pre_clip")
             _clip_grad_norm_or_raise(self.model, 1.0)

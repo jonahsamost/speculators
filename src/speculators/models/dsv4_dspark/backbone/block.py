@@ -41,6 +41,20 @@ _FWD_PROF_MS = float(_os.environ.get("DSPARK_PROFILE_FWD_MS", "2000"))
 _SAT_SUB = None
 
 
+def _finite_diag(stage: str, tensor: torch.Tensor) -> None:
+    """Fail at the first bad decoder substage when diagnostics are enabled."""
+    if _os.environ.get("DSPARK_FINITE_DIAG") != "1":
+        return
+    bad = ~torch.isfinite(tensor)
+    if not bool(bad.any().item()):
+        return
+    coordinates = torch.nonzero(bad, as_tuple=False)[:32].tolist()
+    raise FloatingPointError(
+        f"Non-finite DSV4 DSpark decoder substage {stage}: "
+        f"count={int(bad.sum())}, first_coordinates={coordinates}"
+    )
+
+
 def _prof(tag, fn):
     if not _FWD_PROF:
         return fn()
@@ -70,8 +84,8 @@ class MhcDecoderBlock(nn.Module):
         self,
         streams: torch.Tensor,
         context_x: torch.Tensor,
-        block_freqs: torch.Tensor,
-        context_freqs: torch.Tensor,
+        block_positions: torch.Tensor,
+        context_positions: torch.Tensor,
         attn_bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return updated streams and this block's FFN pre-mix.
@@ -81,18 +95,26 @@ class MhcDecoderBlock(nn.Module):
         _sub = {} if _SAT_SUB is not None else None
         residual = streams
         post, comb, x = _prof("mHC.attn", lambda: self.attn_hc(streams))
+        _finite_diag("mhc_attn_post", post)
+        _finite_diag("mhc_attn_comb", comb)
+        _finite_diag("mhc_attn_input", x)
         if _sub is not None:
             _sub["hc_pre_attn"] = x.detach().float().cpu()
         x = self.attn_norm(x)
+        _finite_diag("attn_norm", x)
         if _sub is not None:
             _sub["attn_norm"] = x.detach().float().cpu()
         x = _prof(
             "MLA.attn",
-            lambda: self.attn(x, context_x, block_freqs, context_freqs, attn_bias),
+            lambda: self.attn(
+                x, context_x, block_positions, context_positions, attn_bias
+            ),
         )
+        _finite_diag("attention_output", x)
         if _sub is not None:
             _sub["attn_out"] = x.detach().float().cpu()
         streams = place(x, residual, post, comb)
+        _finite_diag("post_attention_streams", streams)
         if _sub is not None:
             _sub["post_attn"] = streams.detach().float().cpu()
 
@@ -100,15 +122,22 @@ class MhcDecoderBlock(nn.Module):
         post, comb, x, ffn_pre = _prof(
             "mHC.ffn", lambda: self.ffn_hc(streams, return_pre=True)
         )
+        _finite_diag("mhc_ffn_post", post)
+        _finite_diag("mhc_ffn_comb", comb)
+        _finite_diag("mhc_ffn_input", x)
+        _finite_diag("mhc_ffn_pre", ffn_pre)
         if _sub is not None:
             _sub["hc_pre_ffn"] = x.detach().float().cpu()
         x = self.ffn_norm(x)
+        _finite_diag("ffn_norm", x)
         if _sub is not None:
             _sub["ffn_norm"] = x.detach().float().cpu()
         x = _prof("MoE.ffn", lambda: self.ffn(x))
+        _finite_diag("moe_output", x)
         if _sub is not None:
             _sub["moe_out"] = x.detach().float().cpu()
         streams = place(x, residual, post, comb)
+        _finite_diag("post_moe_streams", streams)
         if _sub is not None:
             _sub["layer_out"] = streams.detach().float().cpu()
             _SAT_SUB.append(_sub)

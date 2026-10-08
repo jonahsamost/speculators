@@ -746,6 +746,13 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             loss_mask, num_anchors, self.block_size
         )
 
+        # ``select_anchors`` repeats genuine positions into fixed-shape padding
+        # slots while leaving their loss validity false.  Let those duplicates
+        # take the same finite context path as real anchors.  ``anchor_valid``
+        # itself remains unchanged and is applied to the aligned loss mask
+        # below, so padded slots contribute no training signal.
+        compute_anchor_valid = anchor_valid.any().expand_as(anchor_valid)
+
         mask_tokens_size = num_anchors * self.block_size
         mask_token_ids = torch.full(
             (1, mask_tokens_size), self.mask_token_id, dtype=torch.long, device=device
@@ -757,7 +764,7 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
 
         context_indices, context_valid = self._anchor_local_context(
             anchor_positions,
-            anchor_valid,
+            compute_anchor_valid,
             document_ids[0],
             self.backbone_cfg.window_size,
         )
@@ -769,6 +776,38 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         local_attn_bias = self._anchor_local_attention_bias(
             context_valid, self.block_size, projected_context.dtype
         )
+
+        finite_diagnostics = os.environ.get("DSPARK_FINITE_DIAG") == "1"
+
+        def assert_finite(stage: str, tensor: torch.Tensor) -> None:
+            if not finite_diagnostics:
+                return
+            bad = ~torch.isfinite(tensor)
+            if not bool(bad.any().item()):
+                return
+            coordinates = torch.nonzero(bad, as_tuple=False)[:32].tolist()
+            bad_anchors = sorted({int(row[0]) for row in coordinates if row})
+            metadata = []
+            for anchor_index in bad_anchors[:16]:
+                metadata.append(
+                    {
+                        "anchor_index": anchor_index,
+                        "anchor_position": int(anchor_positions[anchor_index]),
+                        "loss_valid": bool(anchor_valid[anchor_index]),
+                        "context_tokens": int(context_valid[anchor_index].sum()),
+                        "document_id": int(
+                            document_ids[0, anchor_positions[anchor_index]]
+                        ),
+                    }
+                )
+            raise FloatingPointError(
+                f"Non-finite DSV4 DSpark activation at {stage}: "
+                f"count={int(bad.sum())}, first_coordinates={coordinates}, "
+                f"anchors={metadata}"
+            )
+
+        assert_finite("verifier_hidden_states", hidden_states)
+        assert_finite("projected_local_context", local_context)
 
         block_positions = get_base_indices_for_anchored_blocks(
             position_ids[0, anchor_positions], self.block_size
@@ -804,10 +843,6 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             if os.environ.get("DSPARK_TEACHER_DOUBLE_NORM") == "1":
                 _teacher_h = self.verifier_norm(_teacher_h)
             targets = self.verifier_lm_head(_teacher_h)
-
-        # DSV4 RoPE freqs at the ctx and block absolute positions.
-        ctx_freqs = self._rope_at(context_positions)
-        block_freqs = self._rope_at(block_positions)
 
         # mHC streams across the stack; each block attends noise -> [ctx | block].
         hc = self.backbone_cfg.hc_mult
@@ -857,12 +892,12 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                 _layer.ffn.router.update_load_balance_bias()
 
         final_ffn_pre = None
-        for layer in self.layers:
+        for layer_index, layer in enumerate(self.layers):
             layer_args = (
                 streams,
                 local_context,
-                block_freqs,
-                ctx_freqs,
+                block_positions,
+                context_positions,
                 local_attn_bias,
             )
             if self.grad_checkpoint and self.training:
@@ -876,6 +911,8 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                 )
             else:
                 streams, final_ffn_pre = layer(*layer_args)
+            assert_finite(f"layer_{layer_index}_streams", streams)
+            assert_finite(f"layer_{layer_index}_ffn_pre", final_ffn_pre)
             if _sat:
                 _rec["layers"].append(streams.detach().float().cpu())
 
@@ -939,6 +976,7 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         hidden = self.norm(collapse_streams(streams, final_ffn_pre)).reshape(
             1, mask_tokens_size, -1
         )  # [1, A*B, H]
+        assert_finite("head_hidden", hidden.reshape(num_anchors, self.block_size, -1))
         logits = self.lm_head(hidden)
 
         # ── DSPARK_TRAIN_PARITY_DUMP=1: one-shot, rank0 — write the FIRST anchor's block in the

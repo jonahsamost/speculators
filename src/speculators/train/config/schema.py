@@ -357,6 +357,12 @@ class OptimizerArgs(_Group):
         description="Weight decay for the AdamW optimizer (and the AdamW group in muon "
         "mode).",
     )
+    confidence_head_lr: float | None = Field(
+        default=None,
+        gt=0,
+        description="Optional separate AdamW learning rate for confidence_head "
+        "parameters. When unset, confidence heads use --lr.",
+    )
     muon_lr: float | None = Field(
         default=None,
         description="LR for the Muon (2D weights) group. Only used with --optimizer "

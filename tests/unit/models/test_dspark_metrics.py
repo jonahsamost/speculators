@@ -188,6 +188,88 @@ class TestComputeMetrics:
         assert confidence_logits.grad is not None
         assert torch.isfinite(confidence_logits.grad).all()
 
+    def test_masked_nonfinite_confidence_logit_cannot_poison_backward(self):
+        logits = torch.randn(1, 4, 16, requires_grad=True)
+        targets = torch.randn(1, 4, 16)
+        confidence_logits = torch.tensor(
+            [[0.5, float("nan"), -0.5, float("inf")]], requires_grad=True
+        )
+        loss_mask = torch.tensor([[1, 0, 1, 0]], dtype=torch.float32)
+
+        loss, metrics = compute_metrics(
+            logits,
+            targets,
+            confidence_logits,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+        )
+        loss.backward()
+
+        assert torch.isfinite(loss)
+        assert torch.isfinite(metrics["confidence_loss_sum"])
+        assert confidence_logits.grad is not None
+        assert torch.isfinite(confidence_logits.grad).all()
+        assert torch.count_nonzero(confidence_logits.grad[~loss_mask.bool()]) == 0
+
+    def test_masked_nonfinite_distributions_cannot_poison_backward(self):
+        logits = torch.randn(1, 4, 16, requires_grad=True)
+        targets = torch.randn(1, 4, 16)
+        with torch.no_grad():
+            logits[0, 1] = float("nan")
+            logits[0, 3] = float("inf")
+            targets[0, 1] = float("nan")
+            targets[0, 3] = float("-inf")
+        loss_mask = torch.tensor([[1, 0, 1, 0]], dtype=torch.float32)
+
+        loss, metrics = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+        )
+        loss.backward()
+
+        assert torch.isfinite(loss)
+        assert torch.isfinite(metrics["tv_loss_sum"])
+        assert logits.grad is not None
+        assert torch.isfinite(logits.grad).all()
+        assert torch.count_nonzero(logits.grad[~loss_mask.bool()]) == 0
+
+    def test_supervised_nonfinite_distribution_fails_loudly(self):
+        logits = torch.randn(1, 4, 16)
+        targets = torch.randn(1, 4, 16)
+        logits[0, 1, 0] = float("nan")
+        loss_mask = torch.tensor([[1, 1, 1, 0]], dtype=torch.float32)
+
+        with pytest.raises(FloatingPointError, match="logits=1, targets=0"):
+            compute_metrics(
+                logits,
+                targets,
+                None,
+                loss_mask,
+                block_size=2,
+                loss_config=_DEFAULT_LOSS,
+            )
+
+    def test_supervised_nonfinite_confidence_logit_fails_loudly(self):
+        logits = torch.randn(1, 4, 16)
+        targets = torch.randn(1, 4, 16)
+        confidence_logits = torch.tensor([[0.5, float("nan"), -0.5, 0.0]])
+        loss_mask = torch.tensor([[1, 1, 1, 0]], dtype=torch.float32)
+
+        with pytest.raises(FloatingPointError, match="logits=1, targets=0"):
+            compute_metrics(
+                logits,
+                targets,
+                confidence_logits,
+                loss_mask,
+                block_size=2,
+                loss_config=_DEFAULT_LOSS,
+            )
+
     @pytest.mark.parametrize("sample_from_anchor", [False, True])
     @pytest.mark.parametrize("gamma", [1.0, 4.0])
     def test_confidence_loss_keeps_fixed_decay(self, seed, sample_from_anchor, gamma):

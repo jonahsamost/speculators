@@ -275,6 +275,7 @@ def _render_boundary_rows(
     *,
     tools: list[dict] | None = None,
     completion_reserve_tokens: int = 0,
+    max_assistant_targets: int | None = None,
 ) -> list[BoundaryRow]:
     """Build one training row per assistant turn, masked at its render boundary.
 
@@ -295,13 +296,23 @@ def _render_boundary_rows(
     """
     if completion_reserve_tokens < 0 or completion_reserve_tokens >= max_length:
         raise ValueError("completion_reserve_tokens must be in [0, max_length)")
+    if max_assistant_targets is not None and max_assistant_targets < 1:
+        raise ValueError("max_assistant_targets must be positive")
 
     rows: list[BoundaryRow] = []
+    target_indices = [
+        index
+        for index, turn in enumerate(normalized_conv)
+        if index > 0 and turn["role"] == "assistant"
+    ]
+    if max_assistant_targets is not None:
+        # Search newest-first so an oversized or template-unstable recent turn
+        # does not leave the whole session empty. Stop once N valid rows have
+        # been found, then restore chronological order for deterministic output.
+        target_indices.reverse()
 
-    for j, turn in enumerate(normalized_conv):
-        # j == 0 has no preceding context to bound against; keep it as context only.
-        if turn["role"] != "assistant" or j == 0:
-            continue
+    for j in target_indices:
+        turn = normalized_conv[j]
 
         history = normalized_conv[:j]
         prompt_budget = max_length - completion_reserve_tokens
@@ -351,6 +362,8 @@ def _render_boundary_rows(
                 tools=tools,
             )
             if full_ids[: len(hist_ids)] != hist_ids or boundary < len(hist_ids):
+                if max_assistant_targets is not None:
+                    continue
                 raise BoundaryUnstableError(
                     f"prompt and full renders diverge inside history at "
                     f"assistant turn {j}; cannot derive a boundary loss mask"
@@ -363,7 +376,11 @@ def _render_boundary_rows(
                 "conv": full_conversation,
             }
         )
+        if max_assistant_targets is not None and len(rows) == max_assistant_targets:
+            break
 
+    if max_assistant_targets is not None:
+        rows.reverse()
     return rows
 
 
@@ -397,6 +414,7 @@ def _render_conversation_rows(
     render_endpoint: str,
     max_length: int,
     completion_reserve_tokens: int,
+    max_assistant_targets: int | None,
 ) -> list[BoundaryRow] | None:
     """Render one valid conversation; return ``None`` when it is unusable."""
     if not conv or not isinstance(conv, list):
@@ -414,6 +432,7 @@ def _render_conversation_rows(
             max_length,
             tools=parsed_tools,
             completion_reserve_tokens=completion_reserve_tokens,
+            max_assistant_targets=max_assistant_targets,
         )
     # One row the render endpoint or boundary derivation can't handle must
     # not kill the run. The failure modes can't be enumerated -- templates
@@ -549,6 +568,7 @@ def _preprocess_batch(
     max_length: int,
     minimum_valid_tokens: int | None = None,
     completion_reserve_tokens: int = 0,
+    max_assistant_targets: int | None = None,
 ) -> dict[str, list]:
     """Convert on-policy conversations or speculator-format rows for training."""
 
@@ -602,6 +622,7 @@ def _preprocess_batch(
             render_endpoint,
             max_length,
             completion_reserve_tokens,
+            max_assistant_targets,
         )
         if rows is None:
             continue
@@ -645,6 +666,7 @@ def build_speculator_training_dataset(
     render_endpoint: str | None = None,
     minimum_valid_tokens: int | None = None,
     completion_reserve_tokens: int = 0,
+    max_assistant_targets: int | None = None,
 ) -> HFDataset:
     """Build a speculator training dataset with render-boundary loss masks.
 
@@ -667,6 +689,8 @@ def build_speculator_training_dataset(
         completion_reserve_tokens: For natural-language conversations, trim
             oldest complete history groups until this many tokens remain for
             the captured assistant completion.
+        max_assistant_targets: Keep only the latest N assistant targets from
+            each conversation while retaining their full preceding histories.
     """
     original_cols = dataset.column_names
     # These rows carry their supervision mask, so _preprocess_batch passes them
@@ -699,6 +723,7 @@ def build_speculator_training_dataset(
                 max_length,
                 minimum_valid_tokens,
                 completion_reserve_tokens,
+                max_assistant_targets,
             ),
             batched=True,
             num_proc=num_proc,
@@ -884,6 +909,7 @@ def load_and_preprocess_dataset(
     render_endpoint: str | None = None,
     minimum_valid_tokens: int | None = None,
     completion_reserve_tokens: int = 0,
+    max_assistant_targets: int | None = None,
     allow_empty_output: bool = False,
     trust_remote_code: bool = False,
     skip_token_freq: bool = True,
@@ -911,6 +937,8 @@ def load_and_preprocess_dataset(
         minimum_valid_tokens: Number of tokens to consider for a valid sample
         completion_reserve_tokens: Prompt headroom retained by dropping oldest
             complete history groups before rendering a captured completion.
+        max_assistant_targets: Keep only the latest N assistant targets from
+            each natural-language conversation.
         allow_empty_output: If True, allow returning an empty dataset instead of
                           raising when no samples survive preprocessing.
         trust_remote_code: If True, allows executing code from HF Hub.
@@ -974,6 +1002,7 @@ def load_and_preprocess_dataset(
             render_endpoint=render_endpoint,
             minimum_valid_tokens=minimum_valid_tokens,
             completion_reserve_tokens=completion_reserve_tokens,
+            max_assistant_targets=max_assistant_targets,
         )
         if minimum_valid_tokens is not None:
             log.info(f"Kept {len(preprocessed_dataset)} samples after filtering")

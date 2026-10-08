@@ -749,6 +749,7 @@ def main(cfg: TrainConfig):  # noqa: C901
         val_call_kwargs=val_call_kwargs,
         optimizer=args.optimizer,
         weight_decay=args.weight_decay,
+        confidence_head_lr=args.confidence_head_lr,
         muon_lr=args.muon_lr,
         muon_momentum=args.muon_momentum,
         muon_weight_decay=args.muon_weight_decay,

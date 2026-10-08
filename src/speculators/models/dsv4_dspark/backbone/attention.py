@@ -23,15 +23,30 @@ descriptive attribute names here.
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import nn
 
 from .kernels import get_kernel, torch_kernel
 from .norm import RMSNorm, UnweightedRMSNorm
-from .rotary import apply_rotary_emb
+from .rotary import apply_rotary_emb, freqs_cis_from_positions
 
 _SINK_OP = "sink_block_attention"
 _SHARED_KV_RANK = 3
+
+
+def _finite_diag(stage: str, tensor: torch.Tensor) -> None:
+    if os.environ.get("DSPARK_FINITE_DIAG") != "1":
+        return
+    bad = ~torch.isfinite(tensor)
+    if not bool(bad.any().item()):
+        return
+    coordinates = torch.nonzero(bad, as_tuple=False)[:32].tolist()
+    raise FloatingPointError(
+        f"Non-finite DSV4 DSpark attention substage {stage}: "
+        f"count={int(bad.sum())}, first_coordinates={coordinates}"
+    )
 
 
 @torch_kernel(_SINK_OP)
@@ -65,8 +80,18 @@ def _sink_block_attention_torch(
             f"(single head); got {tuple(k.shape)}"
         )
     s = torch.einsum("nqhd,nkd->nqhk", q.float(), k.float()) * scale
+    _finite_diag("scores_before_bias", s)
     if attn_bias is not None:
         s = s + attn_bias.float().unsqueeze(2)  # [N, Sq, 1, Sk] broadcast over heads
+    # The mask intentionally contributes -inf; only NaNs and +inf are invalid.
+    if os.environ.get("DSPARK_FINITE_DIAG") == "1":
+        invalid_scores = torch.isnan(s) | torch.isposinf(s)
+        if bool(invalid_scores.any().item()):
+            coordinates = torch.nonzero(invalid_scores, as_tuple=False)[:32].tolist()
+            raise FloatingPointError(
+                "Invalid DSV4 DSpark attention scores after bias: "
+                f"count={int(invalid_scores.sum())}, first_coordinates={coordinates}"
+            )
     sink_h = sink.float().view(1, 1, -1, 1)
     # Treat the sink as one extra key with a zero value.  torch.softmax uses a
     # numerically hardened backward; differentiating through our former manual
@@ -74,7 +99,12 @@ def _sink_block_attention_torch(
     # the first DSV4 layer at real training scale, despite finite forward values.
     sink_logits = sink_h.expand(*s.shape[:-1], 1)
     p = torch.softmax(torch.cat([s, sink_logits], dim=-1), dim=-1)[..., :-1]
-    return torch.einsum("nqhk,nkd->nqhd", p, v.float()).to(q.dtype)
+    _finite_diag("softmax_probabilities", p)
+    output = torch.einsum("nqhk,nkd->nqhd", p, v.float())
+    _finite_diag("value_aggregation_fp32", output)
+    output = output.to(q.dtype)
+    _finite_diag("value_aggregation_compute_dtype", output)
+    return output
 
 
 def sink_block_attention(
@@ -95,8 +125,8 @@ class LatentAttention(nn.Module):
 
     ``forward`` takes the block hidden states (queries) and the context+block
     hidden states (keys/values source) already assembled by the caller, plus
-    the precomputed rope frequencies for each, and returns the attention output
-    projected back to ``hidden_size``.
+    the absolute positions for each. RoPE values are built inside each layer
+    so checkpointed layers never share their materialized rotation storage.
     """
 
     def __init__(self, cfg) -> None:
@@ -139,16 +169,21 @@ class LatentAttention(nn.Module):
     def project_kv(self, kv_x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         """Project input to one shared KV head and apply trailing-slice RoPE."""
         rd = self.rope_head_dim
-        kv = self.kv_norm(self.wkv(kv_x))
+        kv = self.wkv(kv_x)
+        _finite_diag("project_kv_linear", kv)
+        kv = self.kv_norm(kv)
+        _finite_diag("project_kv_norm", kv)
+        _finite_diag("project_kv_rope_frequencies", freqs_cis)
         rope = apply_rotary_emb(kv[..., -rd:], freqs_cis)
+        _finite_diag("project_kv_rope", rope)
         return torch.cat([kv[..., :-rd], rope], dim=-1)
 
     def forward(
         self,
         block_x: torch.Tensor,
         context_x: torch.Tensor,
-        block_freqs: torch.Tensor,
-        context_freqs: torch.Tensor,
+        block_positions: torch.Tensor,
+        context_positions: torch.Tensor,
         attn_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Block-gamma draft attention (teacher-forced, no KV cache).
@@ -159,17 +194,44 @@ class LatentAttention(nn.Module):
         Each block query attends densely (non-causal) to ``[context | block]``
         with the per-head sink. Returns ``[N, gamma, dim]``.
         """
-        q = self.project_q(block_x, block_freqs)  # [N, gamma, H, D]
-        kv_ctx = self.project_kv(context_x, context_freqs)  # [N, W, D]
-        kv_blk = self.project_kv(block_x, block_freqs)  # [N, gamma, D]
-        kv = torch.cat(
-            [kv_ctx, kv_blk], dim=1
-        )  # [N, W+gamma, D] (single shared KV head)
-        # Shared-KV: pass the single KV head directly (NO .expand to H heads).
-        # The nkd einsums broadcast it over query heads without materializing
-        # the H×-larger [N, Sk, H, D] tensor (matches vLLM-Ascend #12005).
-        o = sink_block_attention(q, kv, kv, self.attn_sink, self.scale, attn_bias)
-        return self.combine_output(o, block_freqs)
+        # Keep the complete latent-attention path in fp32.  The surrounding
+        # trainer autocasts the draft backbone to bf16, but rare real anchors
+        # can overflow a bf16 Q/K/V or grouped output projection even though
+        # the mathematically accumulated result is representable.  Scores were
+        # already fp32; extending fp32 to the projections removes that partial
+        # precision boundary.  Cast only the final residual update back to the
+        # caller's compute dtype.
+        output_dtype = block_x.dtype
+        with torch.autocast(device_type=block_x.device.type, enabled=False):
+            block_freqs = freqs_cis_from_positions(
+                block_positions, self.rope_head_dim, self.cfg.rope_theta
+            )
+            context_freqs = freqs_cis_from_positions(
+                context_positions, self.rope_head_dim, self.cfg.rope_theta
+            )
+            _finite_diag("block_rope_frequencies", block_freqs)
+            _finite_diag("context_rope_frequencies", context_freqs)
+            block_x_fp32 = block_x.float()
+            context_x_fp32 = context_x.float()
+            q = self.project_q(block_x_fp32, block_freqs)  # [N, gamma, H, D]
+            _finite_diag("project_q", q)
+            kv_ctx = self.project_kv(context_x_fp32, context_freqs)  # [N, W, D]
+            _finite_diag("project_kv_context", kv_ctx)
+            kv_blk = self.project_kv(block_x_fp32, block_freqs)  # [N, gamma, D]
+            _finite_diag("project_kv_block", kv_blk)
+            kv = torch.cat(
+                [kv_ctx, kv_blk], dim=1
+            )  # [N, W+gamma, D] (single shared KV head)
+            # Shared-KV: pass the single KV head directly (NO .expand to H heads).
+            # The nkd einsums broadcast it over query heads without materializing
+            # the H×-larger [N, Sk, H, D] tensor (matches the serving implementation).
+            o = sink_block_attention(q, kv, kv, self.attn_sink, self.scale, attn_bias)
+            _finite_diag("sink_attention_output", o)
+            output = self.combine_output(o, block_freqs)
+            _finite_diag("combined_output_fp32", output)
+        output = output.to(output_dtype)
+        _finite_diag("combined_output_compute_dtype", output)
+        return output
 
     def combine_output(
         self, o: torch.Tensor, q_freqs_cis: torch.Tensor
@@ -181,9 +243,13 @@ class LatentAttention(nn.Module):
         """
         rd = self.rope_head_dim
         derot = apply_rotary_emb(o[..., -rd:], q_freqs_cis, inverse=True)
+        _finite_diag("output_derotation", derot)
         o = torch.cat([o[..., :-rd], derot], dim=-1)
         n, sq = o.shape[0], o.shape[1]
         o = o.reshape(n, sq, self.n_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_groups, self.cfg.o_lora_rank, -1)
         o = torch.einsum("nsgd,grd->nsgr", o, wo_a)
-        return self.wo_b(o.flatten(2))
+        _finite_diag("output_projection_a", o)
+        o = self.wo_b(o.flatten(2))
+        _finite_diag("output_projection_b", o)
+        return o

@@ -150,6 +150,52 @@ def test_over_length_first_turn_yields_no_rows(monkeypatch):
     assert preprocessing._render_boundary_rows(_conv(4), "http://x", 10) == []
 
 
+def test_max_assistant_targets_keeps_latest_targets_with_their_histories(monkeypatch):
+    _patch_encode(
+        monkeypatch,
+        {
+            (5, True): [1, 2, 3],
+            (6, False): [1, 2, 3, 4],
+            (7, True): [1, 2, 3, 4, 5],
+            (8, False): [1, 2, 3, 4, 5, 6],
+        },
+    )
+
+    rows = preprocessing._render_boundary_rows(
+        _conv(8),
+        "http://x",
+        100,
+        max_assistant_targets=2,
+    )
+
+    assert [len(row["conv"]) for row in rows] == [6, 8]
+    assert rows[0]["conv"] == _conv(6)
+    assert rows[1]["conv"] == _conv(8)
+
+
+def test_max_assistant_targets_scans_back_to_latest_valid_target(monkeypatch):
+    _patch_encode(
+        monkeypatch,
+        {
+            (3, True): [1, 2, 3],
+            (3, False): [1, 9],
+            (4, False): [1, 2, 4],
+            (1, True): [1, 2],
+            (2, False): [1, 2, 3],
+        },
+    )
+
+    rows = preprocessing._render_boundary_rows(
+        _conv(4),
+        "http://x",
+        100,
+        max_assistant_targets=1,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["conv"] == _conv(2)
+
+
 def test_completion_reserve_drops_oldest_group_and_keeps_system_and_current_turn(
     monkeypatch,
 ):

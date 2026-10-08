@@ -57,3 +57,26 @@ class TestSelectAnchors:
         anchors, anchor_valid = select_anchors(loss_mask, num_anchors=8, block_size=4)
         selected = anchors[anchor_valid]
         assert torch.equal(selected, torch.sort(selected).values)
+
+    def test_padding_repeats_real_anchors_but_remains_loss_invalid(self):
+        torch.manual_seed(0)
+        loss_mask = torch.tensor([[0, 1, 0, 0, 0, 0]])
+
+        anchors, anchor_valid = select_anchors(
+            loss_mask, num_anchors=4, block_size=2
+        )
+
+        assert torch.equal(anchors, torch.tensor([1, 1, 1, 1]))
+        assert torch.equal(
+            anchor_valid, torch.tensor([True, False, False, False])
+        )
+
+    def test_no_valid_anchors_remain_safely_invalid(self):
+        loss_mask = torch.zeros(1, 6)
+
+        anchors, anchor_valid = select_anchors(
+            loss_mask, num_anchors=4, block_size=2
+        )
+
+        assert torch.equal(anchors, torch.zeros(4, dtype=torch.long))
+        assert not bool(anchor_valid.any())

@@ -7,7 +7,10 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
 
 from speculators.losses import eager
 from speculators.models.dsv4_dspark.backbone.attention import LatentAttention
-from speculators.models.dsv4_dspark.backbone.rotary import precompute_freqs_cis
+from speculators.models.dsv4_dspark.backbone.rotary import (
+    freqs_cis_from_positions,
+    precompute_freqs_cis,
+)
 from speculators.models.dsv4_dspark.core import (
     DSV4DSparkConfig,
     DSV4DSparkDraftModel,
@@ -51,6 +54,7 @@ def test_anchor_local_attention_matches_full_sequence_mask():
         o_groups=2,
         o_lora_rank=4,
         rms_norm_eps=1e-6,
+        rope_theta=10_000.0,
     )
     attention = LatentAttention(cfg)
 
@@ -65,8 +69,6 @@ def test_anchor_local_attention_matches_full_sequence_mask():
 
     context = torch.randn(1, total_seq_len, cfg.hidden_size)
     block_x = torch.randn(anchors.numel(), block, cfg.hidden_size)
-    freqs = _real_freqs(16, cfg.rope_head_dim)
-
     indices, context_valid = DSV4DSparkDraftModel._anchor_local_context(
         anchors, anchor_valid, document_ids, window
     )
@@ -77,8 +79,8 @@ def test_anchor_local_attention_matches_full_sequence_mask():
     compact = attention(
         block_x,
         local_context,
-        freqs[block_positions],
-        freqs[position_ids[indices]],
+        block_positions,
+        position_ids[indices],
         local_bias,
     )
 
@@ -104,12 +106,30 @@ def test_anchor_local_attention_matches_full_sequence_mask():
     reference = attention(
         block_x.reshape(1, num_anchors * block, cfg.hidden_size),
         context,
-        freqs[block_positions.reshape(-1)],
-        freqs[position_ids],
+        block_positions.reshape(1, -1),
+        position_ids.unsqueeze(0),
         full_bias,
     ).reshape(num_anchors, block, cfg.hidden_size)
 
     assert torch.allclose(compact, reference, atol=2e-6, rtol=2e-5)
+
+
+def test_position_rope_is_fresh_and_matches_precomputed_values():
+    """One layer cannot corrupt the materialized RoPE used by another."""
+    positions = torch.tensor([[0, 1, 7], [7, 8, 15]])
+    expected = _real_freqs(16, 8)[positions]
+
+    first = freqs_cis_from_positions(positions, 8, 10_000.0)
+    second = freqs_cis_from_positions(positions, 8, 10_000.0)
+
+    assert torch.allclose(first, expected)
+    assert torch.allclose(second, expected)
+    assert first.data_ptr() != second.data_ptr()
+    first[0, 0, 0] = float("nan")
+    assert torch.isfinite(second).all()
+    # The repeated absolute position must produce the same rotation in both
+    # overlapping windows without sharing storage.
+    assert torch.equal(second[0, 2], second[1, 0])
 
 
 def test_full_dspark_training_forward_keeps_head_contracts():

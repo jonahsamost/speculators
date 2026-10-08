@@ -86,14 +86,39 @@ def compute_metrics(
             dflash_loss_decay, gamma=gamma, sample_from_anchor=sample_from_anchor
         )
 
+    valid = loss_mask.bool()
+    valid_vocab = valid.unsqueeze(-1)
+    invalid_logits = valid_vocab & ~torch.isfinite(logits)
+    invalid_targets = valid_vocab & ~torch.isfinite(targets)
+    if invalid_logits.any().item() or invalid_targets.any().item():
+        raise FloatingPointError(
+            "Non-finite DSpark distributions on supervised positions: "
+            f"logits={int(invalid_logits.sum().item())}, "
+            f"targets={int(invalid_targets.sum().item())}"
+        )
+
+    # Anchor selection pads to a static ``max_anchors`` shape.  Loss functions
+    # such as TV and CE must not see non-finite values from those masked rows:
+    # masking their scalar losses afterwards is too late because softmax
+    # backward has already traversed them. ``where`` also cuts their gradient
+    # path while preserving the exact objective on every supervised row.
+    safe_logits = torch.where(valid_vocab, logits, torch.zeros_like(logits))
+    safe_targets = torch.where(valid_vocab, targets, torch.zeros_like(targets))
     loss, term_losses = compound_loss(
-        logits, targets, loss_mask, pos_idx, loss_config=loss_config, decay_fn=decay_fn
+        safe_logits,
+        safe_targets,
+        loss_mask,
+        pos_idx,
+        loss_config=loss_config,
+        decay_fn=decay_fn,
     )
 
     # Analytical per-position acceptance rate = distributional overlap
     # = 1 - TV; the fused kernel avoids the two full-vocab fp32 softmaxes.
     with torch.no_grad():
-        accept_rate = (1.0 - tv_loss_fn(logits, targets)).float().clamp(0.0, 1.0)
+        accept_rate = (
+            1.0 - tv_loss_fn(safe_logits, safe_targets)
+        ).float().clamp(0.0, 1.0)
         # Per-block cumulative acceptance product over the draft slots (slot 0
         # is the anchor), shared by the accept-length and calibration metrics.
         num_blocks = seq_len // block_size
@@ -109,8 +134,28 @@ def compute_metrics(
         # NaNs even when its logits, soft targets, and forward loss are finite.
         confidence_logits_fp32 = confidence_logits.float()
         c_star = accept_rate.detach()
+
+        # ``select_anchors`` pads each batch to ``max_anchors``.  Those padded
+        # slots are deliberately excluded by ``loss_mask``, but their draft
+        # activations are still materialized.  Do not feed a non-finite padded
+        # activation into BCE and try to remove it afterwards: NaN * 0 remains
+        # NaN, and BCE backward can poison every upstream parameter.  Conversely,
+        # a non-finite supervised slot is a real model/data error and must fail
+        # loudly rather than being silently sanitized.
+        invalid_logits = valid & ~torch.isfinite(confidence_logits_fp32)
+        invalid_targets = valid & ~torch.isfinite(c_star)
+        if invalid_logits.any().item() or invalid_targets.any().item():
+            raise FloatingPointError(
+                "Non-finite DSpark confidence values on supervised positions: "
+                f"logits={int(invalid_logits.sum().item())}, "
+                f"targets={int(invalid_targets.sum().item())}"
+            )
+        safe_confidence_logits = torch.where(
+            valid, confidence_logits_fp32, torch.zeros_like(confidence_logits_fp32)
+        )
+        safe_c_star = torch.where(valid, c_star, torch.zeros_like(c_star))
         bce = binary_cross_entropy_with_logits(
-            confidence_logits_fp32, c_star, reduction="none"
+            safe_confidence_logits, safe_c_star, reduction="none"
         )  # [1, T]
         # D-PACE expects token CE, so keep the confidence BCE on fixed decay.
         confidence_decay_fn = partial(
@@ -122,7 +167,7 @@ def compute_metrics(
         with torch.no_grad():
             mask_f = loss_mask.to(accept_rate.dtype)
             mask_total = mask_f.sum().clamp_min(1.0)
-            conf_prob = confidence_logits_fp32.sigmoid()
+            conf_prob = safe_confidence_logits.sigmoid()
             metrics["confidence_loss_sum"] = conf_loss.detach().clone()
             metrics["confidence_loss_total"] = torch.ones((), device=device)
             metrics["confidence_abs_error_sum"] = (
@@ -164,8 +209,8 @@ def compute_metrics(
         metrics["accept_len_total"] = block_valid.sum().clamp_min(1.0)
 
     # Per-position greedy accuracy
-    pred_ids = torch.argmax(logits, dim=-1)
-    target_ids = torch.argmax(targets, dim=-1)
+    pred_ids = torch.argmax(safe_logits, dim=-1)
+    target_ids = torch.argmax(safe_targets, dim=-1)
     correct_per_pos, total_per_pos = compute_accuracy_multi_step(
         pred_ids, target_ids, loss_mask, pos_idx, block_size
     )
